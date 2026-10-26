@@ -48,3 +48,7 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Project data (not uploaded, regenerate with 01_data_preparation.R)
+data/
+*.rds
