@@ -443,7 +443,7 @@ rm(cor_mat, dens_mat, dens_df); gc()
 # =============================================================================
 # 8. PROBE TYPE BIAS AND BMIQ NORMALISATION
 #
-# !!!! BMIQ is slow: > 8 hours on the test computer !!!!
+# !!!! BMIQ is slow: 9.331187 hours on the test computer !!!!
 #   CPU : 11th Gen Intel Core i7-1185G7 @ 3.00GHz (4 cores / 8 threads, 7 used in parallel)
 #   RAM : 16 GB
 #   OS  : Windows, R 4.3.2
