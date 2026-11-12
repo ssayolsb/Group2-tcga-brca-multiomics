@@ -1,0 +1,407 @@
+---
+title: "TCGA-BRCA multi-omics: data preparation and train/test split"
+subtitle: "RNA-seq, DNA methylation (450k) and protein (RPPA) with clinical data"
+author: "Group 2: Multiomics - Parniyan, Sergi, Baizhen, Paula, Yueling"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+    df_print: kable
+params:
+  seed: 20261014
+  train_prop: 0.7
+  save: false   # true = overwrite data/data_split; false = compare with the saved files
+---
+
+```{r setup, include = FALSE}
+# Paths in the code are relative to the project root (folder with the .Rproj)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5,
+                      fig.align = "center")
+library(curatedTCGAData)        # curated TCGA data as MultiAssayExperiment objects
+library(MultiAssayExperiment)   # container linking several omics to the same patients
+library(TCGAutils)              # helpers for TCGA barcodes and sample types
+
+# Helper: record the number of patients after each preparation step
+flow <- data.frame(step = character(), patients = integer())
+add_step <- function(flow, step, n) rbind(flow, data.frame(step = step, patients = n))
+```
+
+# Overview
+
+This report documents the preparation of the **TCGA breast invasive carcinoma
+(BRCA)** multi-omics data used in the project. It runs the same steps as
+`01_data_preprocess/01_data_preparation.R`. Three omics layers are combined
+with the clinical data:
+
+- **RNA-seq**: RSEM gene-level counts (`RNASeq2Gene`), normalised to `log2(CPM + 1)`.
+- **DNA methylation**: Illumina 450k array, beta values (`Methylation_methyl450`).
+- **Protein**: reverse-phase protein array (`RPPAArray`).
+
+**Steps:**
+
+1. Download the data with `curatedTCGAData` (version 2.1.1).
+2. Keep primary tumour samples from patients with data in all three omics.
+3. Normalise the RNA-seq counts to `log2(CPM + 1)` (no features are filtered).
+4. Harmonise sample and patient identifiers across datasets.
+5. Select female patients with a known pathological stage and define a three-level
+   stage outcome.
+6. Split patients into a **training set (`r params$train_prop * 100`%)** and a
+   **test set (`r (1 - params$train_prop) * 100`%)**, with the same split in every dataset.
+7. Save (or compare with the saved) `.rds` files in `data/data_split/`.
+
+**General principle:** every dataset contains **the same patients in the same
+order**, and the split is done at **patient level** and **before any
+data-driven preprocessing** (filtering, imputation, scaling). Every later QC
+decision is made on the training set only and then applied to the test set.
+The only transformation applied here, `log2(CPM + 1)`, is computed sample by
+sample and therefore does not share information between training and test.
+
+# Data download
+
+## Available assays
+
+With `dry.run = TRUE` the function only lists the assays available for BRCA,
+without downloading anything.
+
+```{r dry-run}
+curatedTCGAData(diseaseCode = "BRCA", assays = "*",
+                version = "2.1.1", dry.run = TRUE)
+```
+
+## Selected assays
+
+| Assay | Content |
+|---|---|
+| `RNASeq2Gene` | RSEM gene-level counts (raw, non-negative) |
+| `Methylation_methyl450` | DNA methylation, Illumina 450k array (beta values, 0–1) |
+| `RPPAArray` | Protein expression, reverse-phase protein array (log2, median-centred) |
+
+The result is a `MultiAssayExperiment` object; the clinical data are in
+`colData()`. Downloads are cached by ExperimentHub, so later runs are fast.
+
+```{r download}
+brca <- curatedTCGAData(
+  diseaseCode = "BRCA",
+  assays      = c("RNASeq2Gene", "Methylation_methyl450", "RPPAArray"),
+  version     = "2.1.1",
+  dry.run     = FALSE
+)
+
+brca
+names(experiments(brca))   # exact assay names used below
+
+flow <- add_step(flow, "Downloaded (patients in colData)", nrow(colData(brca)))
+```
+
+# Sample selection
+
+## Primary tumours with all three omics
+
+`TCGAprimaryTumors()` uses the sample type code in the TCGA barcode
+(e.g. `TCGA-A1-A0SB-01A-...`): it keeps `01` = primary solid tumour and removes
+`06` = metastatic, `11` = solid tissue normal, etc. `intersectColumns()` keeps
+only patients with data in all three omics.
+
+```{r primary-tumours}
+brca <- TCGAprimaryTumors(brca)
+brca <- intersectColumns(brca)
+
+lengths(colnames(brca))    # samples per assay (should be equal)
+
+flow <- add_step(flow, "Primary tumour, all three omics", nrow(colData(brca)))
+```
+
+# Omics and clinical data
+
+Each omics matrix has features in rows and samples in columns. The methylation
+assay is stored on disk (HDF5) and is converted to an in-memory matrix
+(~485,000 probes), which takes some time and memory.
+
+```{r extract}
+counts <- assay(brca[["BRCA_RNASeq2Gene-20160128"]])
+meth   <- as.matrix(assay(brca[["BRCA_Methylation_methyl450-20160128"]]))  # HDF5 -> in-memory matrix
+prot   <- assay(brca[["BRCA_RPPAArray-20160128"]])
+clin   <- as.data.frame(colData(brca))                                     # one row per patient
+
+data.frame(dataset = c("RNA-seq counts", "Methylation", "Protein", "Clinical"),
+           rows    = c(nrow(counts), nrow(meth), nrow(prot), nrow(clin)),
+           columns = c(ncol(counts), ncol(meth), ncol(prot), ncol(clin)),
+           content = c("genes x samples", "CpG probes x samples",
+                       "proteins x samples", "patients x variables"))
+```
+
+## RNA-seq: counts to log2(CPM + 1)
+
+Raw counts should be non-negative and without missing values. RSEM expected
+counts can contain some non-integer values, which is expected.
+
+```{r rna-counts}
+data.frame(check = c("Minimum value", "Maximum value", "Negative values",
+                     "Missing values", "Proportion of integer values"),
+           value = c(min(counts, na.rm = TRUE), max(counts, na.rm = TRUE),
+                     sum(counts < 0, na.rm = TRUE), sum(is.na(counts)),
+                     round(mean(counts == round(counts), na.rm = TRUE), 3)))
+```
+
+Counts per million (CPM) correct for sequencing depth using only each sample's
+own total, so they can be computed before the split without leakage. The
+`log2(x + 1)` transformation gives a scale from 0 to about 20, without negative
+or missing values. **No genes are filtered at this step**: the filtering of
+lowly expressed genes is learned later on the training set only.
+
+```{r rna-cpm, fig.height = 4.5}
+lib_size <- colSums(counts)                          # total counts per sample
+rna      <- log2(t(t(counts) / lib_size * 1e6) + 1)  # log2(CPM + 1), genes x samples
+rm(counts); invisible(gc())
+
+data.frame(check = c("Minimum value", "Maximum value", "Negative values",
+                     "Missing values", "Genes", "Samples"),
+           value = c(round(min(rna), 2), round(max(rna), 2), sum(rna < 0),
+                     sum(is.na(rna)), nrow(rna), ncol(rna)))
+
+hist(lib_size / 1e6, breaks = 40, col = "grey70", border = "white",
+     main = "Library size per sample", xlab = "Total counts (millions)")
+```
+
+The `sampleMap` links each omics sample (full barcode) to its patient.
+
+```{r samplemap}
+smap <- as.data.frame(sampleMap(brca))
+head(smap)
+```
+
+# Identifier harmonisation
+
+## Barcodes to patient IDs
+
+The omics matrices use full sample barcodes (e.g. `TCGA-A1-A0SB-01A-11R-A144-07`),
+while the clinical data use patient IDs (`TCGA-A1-A0SB`). `TCGAbarcode()`
+trims the barcodes to the first 12 characters.
+
+```{r trim-barcodes}
+colnames(rna)  <- TCGAbarcode(colnames(rna))
+colnames(meth) <- TCGAbarcode(colnames(meth))
+colnames(prot) <- TCGAbarcode(colnames(prot))
+```
+
+## Duplicated patients
+
+If a patient had more than one aliquot of the same tumour, only the first is kept.
+
+```{r duplicates}
+data.frame(dataset    = c("RNA-seq", "Methylation", "Protein"),
+           duplicated = c(sum(duplicated(colnames(rna))),
+                          sum(duplicated(colnames(meth))),
+                          sum(duplicated(colnames(prot)))))
+
+rna  <- rna[,  !duplicated(colnames(rna))]
+meth <- meth[, !duplicated(colnames(meth))]
+prot <- prot[, !duplicated(colnames(prot))]
+```
+
+# Clinical selection and outcome
+
+## Female patients
+
+Male breast cancer is rare and biologically different, so only female patients
+are kept.
+
+```{r female}
+table(clin$gender, useNA = "ifany")
+
+clin <- clin[which(clin$gender %in% "female"), ]
+
+flow <- add_step(flow, "Female", nrow(clin))
+```
+
+## Known pathological stage
+
+Patients with stage `"stage x"` (stage cannot be assessed) or a missing stage
+are removed. Missing values are removed explicitly; otherwise they would be
+assigned to the last category of the outcome below.
+
+```{r stage-filter}
+table(clin$pathologic_stage, useNA = "ifany")
+
+clin <- clin[!is.na(clin$pathologic_stage) & !clin$pathologic_stage %in% "stage x", ]
+
+flow <- add_step(flow, "Known pathological stage", nrow(clin))
+```
+
+## Outcome: pathological stage in three categories
+
+| Outcome | Original stages |
+|---|---|
+| `stage i` | stage i, ia, ib |
+| `stage ii` | stage ii, iia, iib |
+| `stage iii` | stage iiia, iiib, iiic, iv |
+
+Stage IV is grouped with stage III because it has very few patients.
+
+```{r outcome}
+clin$outcome_p.stage <- ifelse(clin$pathologic_stage %in% c("stage i", "stage ia", "stage ib"), "stage i",
+                               ifelse(clin$pathologic_stage %in% c("stage ii", "stage iia", "stage iib"), "stage ii",
+                                      "stage iii"))
+
+# Each original stage must map to exactly one category
+table(clin$pathologic_stage, clin$outcome_p.stage, useNA = "ifany")
+```
+
+# Alignment of omics and clinical data
+
+Only patients present in all three omics and in the filtered clinical data are
+kept, in the same order everywhere.
+
+```{r align}
+common <- Reduce(intersect, list(colnames(rna), colnames(meth),
+                                 colnames(prot), rownames(clin)))
+
+rna  <- rna[,  common]
+meth <- meth[, common]
+prot <- prot[, common]
+clin <- clin[common, ]
+
+flow <- add_step(flow, "Aligned across all datasets", length(common))
+
+data.frame(check = c("RNA-seq columns = clinical rows",
+                     "Methylation columns = clinical rows",
+                     "Protein columns = clinical rows"),
+           value = c(all(colnames(rna)  == rownames(clin)),
+                     all(colnames(meth) == rownames(clin)),
+                     all(colnames(prot) == rownames(clin))))
+```
+
+## Patients in rows
+
+Machine learning functions expect patients in rows and features in columns.
+`check.names = FALSE` keeps the original feature names (e.g. `HLA-A` would
+otherwise become `HLA.A`). A `patientID` column is added to each dataset; it
+is an identifier, not a predictor.
+
+```{r transpose}
+rna  <- data.frame(t(rna),  check.names = FALSE, stringsAsFactors = FALSE)
+meth <- data.frame(t(meth), check.names = FALSE, stringsAsFactors = FALSE)
+prot <- data.frame(t(prot), check.names = FALSE, stringsAsFactors = FALSE)
+
+rna$patientID  <- rownames(rna)
+meth$patientID <- rownames(meth)
+prot$patientID <- rownames(prot)
+```
+
+# Train/test split
+
+Patients are split at random into a training set and a test set. The seed is
+set right before sampling, so the split is reproducible.
+
+```{r split}
+set.seed(params$seed)
+
+train_ids <- sample(rownames(clin), size = round(params$train_prop * nrow(clin)))
+test_ids  <- setdiff(rownames(clin), train_ids)
+
+rna.train  <- rna[train_ids, ]
+meth.train <- meth[train_ids, ]
+prot.train <- prot[train_ids, ]
+clin.train <- clin[train_ids, ]
+
+rna.test   <- rna[test_ids, ]
+meth.test  <- meth[test_ids, ]
+prot.test  <- prot[test_ids, ]
+clin.test  <- clin[test_ids, ]
+```
+
+## Sanity checks
+
+No patient may appear in both sets, and the rows must be in the same order in
+all the datasets of each set.
+
+```{r split-checks}
+data.frame(
+  check = c("No overlap between training and test",
+            "Training: RNA-seq = clinical", "Training: methylation = clinical",
+            "Training: protein = clinical",
+            "Test: RNA-seq = clinical", "Test: methylation = clinical",
+            "Test: protein = clinical"),
+  value = c(length(intersect(train_ids, test_ids)) == 0,
+            all(rownames(rna.train)  == rownames(clin.train)),
+            all(rownames(meth.train) == rownames(clin.train)),
+            all(rownames(prot.train) == rownames(clin.train)),
+            all(rownames(rna.test)   == rownames(clin.test)),
+            all(rownames(meth.test)  == rownames(clin.test)),
+            all(rownames(prot.test)  == rownames(clin.test)))
+)
+```
+
+## Outcome distribution
+
+The split is **not stratified**, so the proportion of each stage is checked in
+both sets.
+
+```{r outcome-props}
+tab <- rbind(training = table(clin.train$outcome_p.stage),
+             test     = table(clin.test$outcome_p.stage))
+data.frame(set = rownames(tab), patients = rowSums(tab),
+           round(prop.table(tab, 1), 3), check.names = FALSE, row.names = NULL)
+```
+
+# Saved datasets
+
+Each dataset is a separate `.rds` file in `data/data_split/`. By default
+(`params$save = false`) this report does not overwrite them: it checks that the
+patients and features it obtains are the same as in the saved files used by
+the rest of the project.
+
+```{r save}
+path.x <- "./data/data_split"
+objs <- list(rna.train  = rna.train,  meth.train = meth.train,
+             prot.train = prot.train, clin.train = clin.train,
+             rna.test   = rna.test,   meth.test  = meth.test,
+             prot.test  = prot.test,  clin.test  = clin.test)
+
+if (isTRUE(params$save)) {
+  dir.create(path.x, showWarnings = FALSE, recursive = TRUE)
+  for (nm in names(objs)) saveRDS(objs[[nm]], file = file.path(path.x, paste0(nm, ".rds")))
+}
+
+do.call(rbind, lapply(names(objs), function(nm) {
+  file  <- file.path(path.x, paste0(nm, ".rds"))
+  saved <- if (file.exists(file)) readRDS(file) else NULL
+  data.frame(file     = paste0(nm, ".rds"),
+             patients = nrow(objs[[nm]]),
+             columns  = ncol(objs[[nm]]),
+             same_patients_as_saved = !is.null(saved) && identical(rownames(saved), rownames(objs[[nm]])),
+             same_columns_as_saved  = !is.null(saved) && identical(colnames(saved), colnames(objs[[nm]])))
+}))
+```
+
+# Summary
+
+```{r flow}
+flow
+```
+
+1. **Three omics layers and clinical data** were downloaded from TCGA-BRCA and
+   restricted to primary tumours from patients with data in all three omics.
+2. **RNA-seq counts were normalised** to `log2(CPM + 1)`, without filtering any gene.
+3. **Identifiers were harmonised** at patient level (`TCGA-XX-XXXX`).
+4. **`r nrow(clin)` female patients with a known pathological stage** were kept,
+   with a three-level outcome (stage i / ii / iii, stage iv grouped into iii).
+5. Patients were split into **`r length(train_ids)` for training** and
+   **`r length(test_ids)` for testing**, with the same split in every dataset and
+   no overlap.
+
+**Next step:** quality control of each omics layer on the training set
+(`02_qc_*`).
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

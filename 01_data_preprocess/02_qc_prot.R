@@ -9,7 +9,7 @@
 #          prot_qc_params.rds       (parameters learned on train, to apply to test)
 #
 #  RPPA values are relative protein levels: log2 scale, normalised and
-#  median-centred per antibody by TCGA. Negative values are expected
+#  median-centred per protein by TCGA. Negative values are expected
 #  (below the cohort median). Values are comparable across patients for the
 #  same protein, but not between different proteins.
 #
@@ -99,11 +99,11 @@ head(colnames(prot), 20)                               # antibody names (total a
 # =============================================================================
 # 2. SANITY CHECKS
 # Expected: log2 relative values centred around 0 (negatives are normal),
-# no duplicated patients or antibodies.
+# no duplicated patients or proteins.
 # =============================================================================
 data.frame(
-  check = c("Patients", "Proteins (antibodies)", "Phospho-specific antibodies",
-            "Missing values", "Duplicated patients", "Duplicated antibodies",
+  check = c("Patients", "Proteins", "Phospho-specific proteins",
+            "Missing values", "Duplicated patients", "Duplicated proteins",
             "Minimum value", "Maximum value", "Median of protein medians"),
   value = c(nrow(prot), ncol(prot),
             sum(grepl("_p[STY]", colnames(prot))),          # e.g. AKT_pS473
@@ -119,7 +119,7 @@ data.frame(
 # =============================================================================
 
 # ---- 3a. Missing values per protein --------------------------------------------
-# Some antibodies were added to or removed from the TCGA RPPA panel between
+# Some proteins were added to or removed from the TCGA RPPA panel between
 # batches, so they can be missing in a subset of samples.
 na_prot <- colMeans(is.na(prot))
 plot_na_bins(na_prot, "Missing values per protein",
@@ -137,7 +137,7 @@ bad_samples
 
 
 # =============================================================================
-# 4. DATA-DRIVEN FILTERING (learned on the training set)
+# 4. DATA-DRIVEN FILTERING (defined on the training set)
 # =============================================================================
 
 # ---- 4a. Remove low-quality samples -------------------------------------------
@@ -204,7 +204,7 @@ outlier_samples   # flagged for inspection, not removed automatically
 # =============================================================================
 # ---- 6a. Variability of RPPA proteins (SD across samples) ---------------------
 # Standard deviation of each protein across samples, for total and phospho-specific
-# antibodies. Proteins with near-zero SD would carry no information to distinguish
+# proteins. Proteins with near-zero SD would carry no information to distinguish
 # patients; with ~200 proteins, all are usually kept.
 prot_stats <- data.frame(protein = colnames(prot),
                          sd      = colSds(prot),
@@ -348,7 +348,7 @@ if (do_batch) {
 # 9. RNA-PROTEIN CONCORDANCE (sample identity check)
 # For well-known breast cancer markers, gene expression and protein level should
 # be positively correlated. A sample with discordant values in several markers
-# may be a sample swap. Antibody names differ between panel versions: check the
+# may be a sample swap. Protein names differ between panel versions: check the
 # exact names with grep() and adjust the mapping below if needed.
 # =============================================================================
 do_rna_check <- TRUE

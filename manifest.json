@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "locale": "en_US",
+  "platform": "4.3.2",
+  "metadata": {
+    "appmode": "static",
+    "primary_rmd": null,
+    "primary_html": "reports/01_data_preparation.html",
+    "content_category": null,
+    "has_parameters": false
+  },
+  "packages": null,
+  "files": {
+    "01_data_preprocess/01_data_preparation.R": {
+      "checksum": "462ee1c01231a9f186406f24872cf96a"
+    },
+    "01_data_preprocess/01_data_preparation.Rmd": {
+      "checksum": "846d8dc0d3804aa9caede31ba5edd8d7"
+    },
+    "01_data_preprocess/02_qc_meth.R": {
+      "checksum": "6d4aeabb79e254a8c345d2bf5ff86272"
+    },
+    "01_data_preprocess/02_qc_meth.Rmd": {
+      "checksum": "18bc1c33d08c653a4e185644ddabd5d5"
+    },
+    "01_data_preprocess/02_qc_prot.R": {
+      "checksum": "427602cda2bf25586b417f5ed0847957"
+    },
+    "01_data_preprocess/02_qc_prot.Rmd": {
+      "checksum": "fbe0759312f768b08934598878ce6cfe"
+    },
+    "01_data_preprocess/02_qc_rnaseq.R": {
+      "checksum": "e6097765dba3825188b70caf13bb3bbf"
+    },
+    "01_data_preprocess/02_qc_rnaseq.Rmd": {
+      "checksum": "a7393a967f32842a8b1c186b5b1424ad"
+    },
+    "01_data_preprocess/03_apply_preprocessing.R": {
+      "checksum": "2c501c6b66bf8eac8010184d9a775a21"
+    },
+    "01_data_preprocess/README.md": {
+      "checksum": "259fc18f58d17d2b1f6fe9dcb336674f"
+    },
+    "02_ML_methods/diablo/README.md": {
+      "checksum": "ab2b47b99edaebed0de8e65272f72c1d"
+    },
+    "02_ML_methods/xgboost_elastic_net/README.md": {
+      "checksum": "489e6087f0bcddb1fd5b7d07a1572bf2"
+    },
+    "data/data_split/clin.test.rds": {
+      "checksum": "8e0f4d156fbb82f4a52bf8bb75b2df18"
+    },
+    "data/data_split/clin.train.rds": {
+      "checksum": "8675b068395bb0aa90c0c186f396fbcd"
+    },
+    "data/data_split/meth.test.rds": {
+      "checksum": "8ec03bce10f20a96bfcebac6962e3ea1"
+    },
+    "data/data_split/meth.train.rds": {
+      "checksum": "aec28eab830904b0029d957abbe42fdd"
+    },
+    "data/data_split/prot.test.rds": {
+      "checksum": "2cab4b7b03bdc8b7b447021a16d4d532"
+    },
+    "data/data_split/prot.train.rds": {
+      "checksum": "24bc225b849476d1649f6810b1b8944c"
+    },
+    "data/data_split/rna.test.rds": {
+      "checksum": "5f505010903dc281d3774f26cd97f063"
+    },
+    "data/data_split/rna.train.rds": {
+      "checksum": "96e6ef378bfcd24153a3580aca2b53aa"
+    },
+    "data/processed/meth.test.region_beta.rds": {
+      "checksum": "d683d96f0004e572071ae2dd2dd55aee"
+    },
+    "data/processed/meth.test.region_M.rds": {
+      "checksum": "5ee721d8931a30219e2eef52026c9ab3"
+    },
+    "data/processed/meth.train.cpg_beta.rds": {
+      "checksum": "76b8c5393f0e7cea0ede7539414eebcf"
+    },
+    "data/processed/meth.train.region_beta.rds": {
+      "checksum": "0681f43d21f63590fa523ae764a95e3a"
+    },
+    "data/processed/meth.train.region_M.rds": {
+      "checksum": "16f595fd7797467ea766babd692af564"
+    },
+    "data/processed/meth_qc_params.rds": {
+      "checksum": "5a3cfbc18d40f74e91ce8044adae8c26"
+    },
+    "data/processed/prot.test.filtered.rds": {
+      "checksum": "62bd240e938db1d6285418688a02d844"
+    },
+    "data/processed/prot.train.filtered.rds": {
+      "checksum": "085a4765307615efa690f6552288b516"
+    },
+    "data/processed/prot_qc_params.rds": {
+      "checksum": "7c2d6e83d91944547fdc1100c678b641"
+    },
+    "data/processed/rna.test.filtered.rds": {
+      "checksum": "aae16c47f63b727108fb5a3e1414d806"
+    },
+    "data/processed/rna.train.filtered.rds": {
+      "checksum": "5ca21db64978e17e68b6f3ee4712d2e5"
+    },
+    "data/processed/rna_qc_params.rds": {
+      "checksum": "0a3b493ab04e82d9a16a96fc54ea62c9"
+    },
+    "data/processed/test_qc_log.csv": {
+      "checksum": "634b3b295a8976f05ce7887168a9d8e2"
+    },
+    "LICENSE": {
+      "checksum": "8e991de40a4a51a86c23edef9c1d1cb9"
+    },
+    "README.md": {
+      "checksum": "afa4a0c0cb075955274c570edb7c96dc"
+    },
+    "renv.lock": {
+      "checksum": "64c7f3431e5c3f8aa2ffd2367664fe3f"
+    },
+    "reports/01_data_preparation.html": {
+      "checksum": "d56d230118df5032ce24885863bc04a5"
+    },
+    "reports/02_qc_meth.html": {
+      "checksum": "c237b23471386c4f0e68eab17db9f9bc"
+    },
+    "reports/02_qc_prot.html": {
+      "checksum": "1b75979f7e9638c41d5559adae8330b2"
+    },
+    "reports/02_qc_rnaseq.html": {
+      "checksum": "6d15ba21f0ae4bb2935815fc53cab35b"
+    },
+    "reports/04_diablo.html": {
+      "checksum": "0160643ef1fc0f0b842feaa6a35c7942"
+    },
+    "reports/04_xgboost_elastic_net.html": {
+      "checksum": "1c33246d713792de3e24d2fbeb0c3430"
+    },
+    "shinyapp/.Rprofile": {
+      "checksum": "80b4e57e71d6d2ab747d4442ae4925af"
+    },
+    "shinyapp/05_make_app_data.R": {
+      "checksum": "83a363af37fb8d3e20d2500448a5c3f4"
+    },
+    "shinyapp/06_precompute_results.R": {
+      "checksum": "8c6d500ec774961dec18431bea4e4bbc"
+    },
+    "shinyapp/app.R": {
+      "checksum": "0d09073e427564b5bf0667762b7ecd24"
+    },
+    "shinyapp/data/data_split/clin.test.rds": {
+      "checksum": "542487999a5421b506710320c35b9c47"
+    },
+    "shinyapp/data/data_split/clin.train.rds": {
+      "checksum": "7c2eb80528ec173f1c9b641665bc9bcc"
+    },
+    "shinyapp/data/data_split/prot.train.rds": {
+      "checksum": "e44139acd7a2ebff2d8c59ce32b602f6"
+    },
+    "shinyapp/data/processed/meth.test.region_M.rds": {
+      "checksum": "83c7190395e516d9d83aef8d4c6925d6"
+    },
+    "shinyapp/data/processed/meth.train.region_M.rds": {
+      "checksum": "5d93320eb2e270d6d9d133e907d52f3f"
+    },
+    "shinyapp/data/processed/prot.test.filtered.rds": {
+      "checksum": "0f57b4a5d8ee2fc4cd481dd221c0e0fc"
+    },
+    "shinyapp/data/processed/prot.train.filtered.rds": {
+      "checksum": "ce9956d455983bc14a3674d7c33de798"
+    },
+    "shinyapp/data/processed/prot_qc_params.rds": {
+      "checksum": "8bcba1f66796f3ecb1d4992e8ac49803"
+    },
+    "shinyapp/data/processed/rna.test.filtered.rds": {
+      "checksum": "9e41766d89f726a4a99fb14942bbd87f"
+    },
+    "shinyapp/data/processed/rna.train.filtered.rds": {
+      "checksum": "3c153b83dc04e1f14868e798c68012c8"
+    },
+    "shinyapp/modeling.R": {
+      "checksum": "39daa568936552e4a24021dbefc11009"
+    },
+    "shinyapp/R/about_page.R": {
+      "checksum": "000c249c7fc6b05b581259088a1c7eb1"
+    },
+    "shinyapp/R/app_helpers.R": {
+      "checksum": "ab1d05af4e450083a9bd6f395b784fbf"
+    },
+    "shinyapp/R/predict_page.R": {
+      "checksum": "51ada08c1a9d5088b4960a969a1b6c82"
+    },
+    "shinyapp/R/results_page.R": {
+      "checksum": "d90e8f3b0784adb17ae2e088bbcc6ecc"
+    },
+    "shinyapp/README.md": {
+      "checksum": "f466738fa4016035fd24cad339854d60"
+    },
+    "shinyapp/renv.lock": {
+      "checksum": "7b35c4a5205db40fc436f64444f74e4c"
+    },
+    "shinyapp/results/all_results.rds": {
+      "checksum": "865d87df707293283c50bd49c6ddeadd"
+    }
+  },
+  "users": null
+}

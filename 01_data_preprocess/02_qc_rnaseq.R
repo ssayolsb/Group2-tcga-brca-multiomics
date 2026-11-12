@@ -134,23 +134,14 @@ plot_zero_bins(zero_sample, "Zeros per patient", "Percentage of genes with value
 # ---- 3c. Expression level of detected values -----------------------------------
 # Mean of the non-zero values of each gene: how strongly a gene is expressed
 # when it is detected. A bimodal distribution separates low-expression noise from
-# clearly expressed genes; the valley between the two modes is used as threshold.
+# clearly expressed genes; a data-derived threshold on this mean is used.
 nz_mean <- apply(X, 2, function(x) if (any(x > 0)) mean(x[x > 0]) else 0)
 
-# Data-driven valley: minimum of the density between the two modes.
-# Check it in the plot and adjust the search range or the value if needed.
+# Data-driven threshold: minimum of the density between 1 and 7.
 d      <- density(nz_mean)
 search <- d$x > 1 & d$x < 7
 nz_cut <- round(d$x[search][which.min(d$y[search])], 2)
 nz_cut
-
-ggplot(data.frame(nz_mean), aes(nz_mean)) +
-  geom_histogram(bins = 60, fill = "#2C7FB8", colour = "white") +
-  geom_vline(xintercept = nz_cut, linetype = 2, colour = "#D73027") +
-  labs(title = "Mean expression of non-zero values per gene",
-       subtitle = sprintf("Dashed red line = valley of the distribution (%.2f)", nz_cut),
-       x = "Mean of non-zero log2(CPM + 1)", y = "Genes") +
-  theme_qc()
 
 # ---- 3d. Filtering --------------------------------------------------------------
 # Genes are removed if they carry no information or look like detection noise:
@@ -548,7 +539,7 @@ rna_df <- rna_df[, c(ncol(rna_df), 1:(ncol(rna_df) - 1))]   # patientID as first
 
 saveRDS(rna_df, file.path(path.x, "rna.train.filtered.rds"))          # filtered genes, log2(CPM + 1)
 
-# Parameters learned on the training set, to apply the same filtering to the test set
+# Parameters estimated on the training set, to apply the same filtering to the test set
 saveRDS(list(kept_genes = colnames(X_filt),   # genes kept after filtering
              nz_cut     = nz_cut,             # threshold of the non-zero mean
              filter_log = filter_log,         # reason for removal of each gene

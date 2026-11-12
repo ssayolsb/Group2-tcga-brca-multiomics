@@ -50,5 +50,12 @@ po/*~
 rsconnect/
 
 # Project data (not uploaded, regenerate with 01_data_preparation.R)
-data/
+/data/
 *.rds
+# Results shown in the app ("All results" tab) and the reduced app data
+!shinyapp/results/*.rds
+!shinyapp/data/**/*.rds
+# Quarto book (generated)
+book/_book/
+.quarto/
+book/.quarto/

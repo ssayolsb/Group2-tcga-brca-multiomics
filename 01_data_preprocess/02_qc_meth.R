@@ -124,16 +124,14 @@ y_probes <- rownames(anno)[which(anno$chr == "chrY")]
 # =============================================================================
 
 # ---- 3a. Missing values per probe (all probes) -------------------------------
-# Proportion of samples with NA for each probe. TCGA level 3 data contain a block
-# of probes that are NA in (almost) all samples (masked during TCGA processing).
-# These probes would inflate the missing rate of every sample by the same amount
-# (~18%), so they are excluded before assessing samples (step 3b).
+# Proportion of samples with NA for each probe. Probes with NA in more than 20%
+# of samples are not used to assess the samples (step 3b).
 na_probe <- colMeans(is.na(meth))
 plot_na_bins(na_probe, "Missing values per probe",
              "Percentage of samples with missing value")
 
 # ---- 3b. Missing values per sample (probes measured in most samples) ---------
-# Only probes measured in at least 80% of samples are used, so the per-sample
+# With the remaining probes (measured in at least 80% of samples), the per-sample
 # missing rate reflects sample quality (e.g. poor DNA, failed hybridisation).
 qc_probes <- names(na_probe)[na_probe <= 0.2]
 na_sample <- rowMeans(is.na(meth[, qc_probes]))
@@ -210,12 +208,11 @@ dim(meth)
 
 
 # =============================================================================
-# 5. DATA-DRIVEN PROBE FILTERING (learned on the training set)
+# 5. DATA-DRIVEN PROBE FILTERING (defined on the training set)
 # =============================================================================
 
 # ---- 5a. Probes with many missing values -------------------------------------
-# Remove probes with missing values in more than 20% of samples (includes the
-# block of probes masked by TCGA seen in step 3a)
+# Remove probes with missing values in more than 20% of samples
 na_probe <- colMeans(is.na(meth))
 sum(na_probe > 0.2)                      # number of probes removed
 meth     <- meth[, na_probe <= 0.2]

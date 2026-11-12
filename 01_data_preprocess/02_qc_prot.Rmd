@@ -1,0 +1,496 @@
+---
+title: "Exploratory data analysis and quality control of TCGA-BRCA RPPA protein data"
+subtitle: "Training set"
+author: "Group 2: Multiomics - Parniyan, Sergi, Baizhen, Paula, Yueling"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+# Paths in the code are relative to the project root (folder with the .Rproj)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5,
+                      fig.align = "center")
+```
+
+# Overview
+
+This report documents the exploratory data analysis (EDA) and quality control (QC) of the
+**reverse-phase protein array (RPPA) data of the TCGA-BRCA training set**. The aim is to decide
+which proteins and patients can be used in the models, and detect possible technical problems (outlier samples, duplicated or mixed-up
+samples, batch effects).
+
+**Data**
+
+- Input: `data/data_split/prot.train.rds`, with one row per patient and one column per protein, the clinical data `clin.train.rds` and, for the identity check, the RNA data `rna.train.rds`.
+- Values: **log2 relative protein levels**, normalised and **median-centred per protein by TCGA**. Negative values are therefore expected (below the cohort median). Values are comparable between patients for the same protein, but not between different proteins.
+- Some proteins are measured in their **phosphorylated** (active) form (e.g. `AKT_pS473`); they are labelled phospho-specific in the plots and tables below.
+- Output (written by `02_qc_prot.R`): the filtered data (`prot.train.filtered.rds`) and the QC parameters (`prot_qc_params.rds`: proteins kept and the rule for low-quality samples), used to apply exactly the same QC to the test set.
+
+**General principle**: as in the other QC reports, the goal is to separate technical problems
+from biological variation. Thresholds are derived from the data whenever possible, and atypical
+samples are flagged and inspected rather than removed automatically.
+
+All decisions are made on the training set only. This report does not overwrite any file
+(the saving step is shown but not run). Knit it from the project root with
+`rmarkdown::render("01_data_preprocess/02_qc_prot.Rmd")`.
+
+# Setup
+
+Packages, a common plot theme and a helper function used in the report.
+
+```{r}
+library(matrixStats)   # fast row/column statistics on matrices
+library(ggplot2)
+```
+
+```{r}
+theme_qc <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(plot.title    = element_text(face = "bold"),
+          plot.subtitle = element_text(colour = "grey40", size = 9),
+          legend.position = "top")
+}
+```
+
+The barplot helper groups the proportion of missing values in bins (green = no missing,
+blue = some missing, red = high missingness).
+
+```{r}
+plot_na_bins <- function(na_frac, title, x_lab, step = 0.05, max_frac = 1) {
+  upper  <- seq(step, max_frac, by = step)
+  breaks <- c(-Inf, 0, upper, if (max_frac < 1) Inf)
+  labels <- c("0%", paste0(round(100 * (upper - step)), "-", round(100 * upper), "%"),
+              if (max_frac < 1) paste0("> ", round(100 * max_frac), "%"))
+  df <- as.data.frame(table(bin = cut(na_frac, breaks = breaks, labels = labels)))
+  df$pct <- df$Freq / sum(df$Freq)
+  
+  n_bins   <- nrow(df)
+  high_lab <- if (max_frac < 1) paste0("> ", round(100 * max_frac), "% missing") else "> 90% missing"
+  is_high  <- if (max_frac < 1) seq_len(n_bins) == n_bins else c(0, upper) > 0.9
+  df$group <- factor(ifelse(seq_len(n_bins) == 1, "No missing",
+                            ifelse(is_high, high_lab, "Some missing")),
+                     levels = c("No missing", "Some missing", high_lab))
+  
+  ggplot(df, aes(bin, Freq, fill = group)) +
+    geom_col(width = 0.8) +
+    geom_text(data = subset(df, Freq > 0),
+              aes(label = sprintf("%d\n(%.0f%%)", Freq, 100 * pct)),
+              vjust = -0.2, size = 2.6, lineheight = 0.85) +
+    scale_fill_manual(values = c("#1A9850", "#2C7FB8", "#D73027"), name = NULL, drop = FALSE) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+    labs(title = title, subtitle = sprintf("n = %d", length(na_frac)),
+         x = x_lab, y = "Count") +
+    theme_qc() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+# Data loading
+
+The data are read as a numeric matrix with patients in rows and proteins in columns, and the
+clinical data are put in the same patient order.
+
+```{r}
+path.x <- "./data/data_split"
+
+df <- readRDS(file.path(path.x, "prot.train.rds"))
+prot <- as.matrix(df[, colnames(df) != "patientID"])   # drop the ID column (not numeric)
+rownames(prot) <- df$patientID                         # patient IDs as row names
+rm(df)
+
+clin <- readRDS(file.path(path.x, "clin.train.rds"))
+clin <- clin[rownames(prot), ]                         # same patients, same order
+
+class(prot); dim(prot)
+head(colnames(prot), 20)                               # antibody names (total and phospho forms)
+```
+
+# Sanity checks
+
+For TCGA RPPA data we expect log2 relative values centred around 0 (negative values are
+normal), medians of the proteins close to 0, and no duplicated patients or proteins.
+
+```{r}
+data.frame(
+  check = c("Patients", "Proteins", "Phospho-specific proteins",
+            "Missing values", "Duplicated patients", "Duplicated proteins",
+            "Minimum value", "Maximum value", "Median of protein medians"),
+  value = c(nrow(prot), ncol(prot),
+            sum(grepl("_p[STY]", colnames(prot))),          # e.g. AKT_pS473
+            sum(is.na(prot)),
+            sum(duplicated(rownames(prot))), sum(duplicated(colnames(prot))),
+            round(min(prot, na.rm = TRUE), 2), round(max(prot, na.rm = TRUE), 2),
+            round(median(colMedians(prot, na.rm = TRUE)), 3))
+)
+```
+
+# Missing values
+
+## Missing values per protein
+
+Some proteins were added to or removed from the TCGA RPPA panel between batches, so they can be
+missing in a subset of the samples. Proteins missing in many samples cannot be used reliably.
+
+```{r}
+na_prot <- colMeans(is.na(prot))
+plot_na_bins(na_prot, "Missing values per protein",
+             "Percentage of samples with missing value")
+```
+
+## Missing values per sample
+
+The missing rate per sample is computed only with the proteins measured in at least 80% of the
+samples, so that it reflects the quality of the sample and not the changes in the panel.
+Samples with **more than 5% missing proteins** are flagged as low quality.
+
+```{r}
+qc_prot   <- names(na_prot)[na_prot <= 0.2]
+na_sample <- rowMeans(is.na(prot[, qc_prot]))
+plot_na_bins(na_sample, "Missing values per sample",
+             "Percentage of proteins with missing value", step = 0.01, max_frac = 0.10)
+
+# Samples with more than 5% missing proteins are flagged as low quality
+bad_samples <- names(na_sample)[na_sample > 0.05]
+bad_samples
+```
+
+Low-quality samples (if any) are listed above: `r length(bad_samples)` sample(s).
+
+# Data-driven filtering
+
+The two filters below are defined on the training set and saved, so that the test set is
+filtered with exactly the same rules.
+
+## Remove low-quality samples
+
+The samples flagged in the previous step are removed. If any sample is removed here, it should
+also be removed from the RNA and methylation data to keep the datasets aligned.
+
+```{r}
+prot <- prot[!rownames(prot) %in% bad_samples, , drop = FALSE]
+clin <- clin[rownames(prot), ]
+# If samples are removed, also remove them from rna and meth to keep all datasets aligned
+```
+
+## Remove proteins missing in more than 20% of samples
+
+Proteins measured in fewer than 80% of the samples are removed. The number of proteins removed is
+shown below.
+
+```{r}
+na_prot <- colMeans(is.na(prot))
+sum(na_prot > 0.2)                       # number of proteins removed
+prot    <- prot[, na_prot <= 0.2, drop = FALSE]
+```
+
+After filtering, **`r ncol(prot)` proteins** and **`r nrow(prot)` patients** are kept.
+
+# Distributions per sample and outlier samples
+
+After the TCGA normalisation, all samples should have similar distributions centred around 0. A
+shifted or much wider distribution may indicate a technical problem, such as a poor protein
+loading of the sample on the array.
+
+## Boxplot per sample
+
+Samples are ordered by their median; the dashed red line marks the cohort median (0).
+
+```{r}
+box_df <- data.frame(patientID = rep(rownames(prot), ncol(prot)),
+                     value     = as.vector(prot))
+box_df$patientID <- factor(box_df$patientID,
+                           levels = rownames(prot)[order(rowMedians(prot))])
+
+ggplot(box_df, aes(x = patientID, y = value)) +
+  geom_boxplot(outlier.size = 0.2, linewidth = 0.2, fill = "grey85") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#D73027") +
+  labs(title = "Distribution of protein levels per sample",
+       subtitle = "Samples ordered by median; dashed line = cohort median (0)",
+       x = "Samples", y = "log2 relative protein level") +
+  theme_qc() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+## Median and spread per sample
+
+Each point is a sample, placed by the median and the interquartile range (IQR) of its protein
+levels. Samples far from the cloud (Tukey far-out fences, 3 × IQR, on the medians or on the IQRs)
+are flagged as outliers. They are **flagged for inspection, not removed**.
+
+```{r}
+sample_stats <- data.frame(patientID = rownames(prot),
+                           median    = rowMedians(prot),
+                           iqr       = rowIQRs(prot))
+
+# Tukey fences (Q1 - 3 IQR, Q3 + 3 IQR) on the sample medians and IQRs
+tukey_out <- function(x, k = 3) {
+  q <- quantile(x, c(0.25, 0.75)); r <- diff(q)
+  x < q[1] - k * r | x > q[2] + k * r
+}
+sample_stats$outlier <- tukey_out(sample_stats$median) | tukey_out(sample_stats$iqr)
+
+ggplot(sample_stats, aes(x = median, y = iqr, colour = outlier)) +
+  geom_point(size = 2, alpha = 0.7) +
+  scale_colour_manual(values = c(`FALSE` = "grey40", `TRUE` = "#D73027"),
+                      labels = c("Other samples", "Tukey outlier (3 x IQR)"), name = NULL) +
+  labs(title = "Median vs. spread of protein levels per sample",
+       subtitle = "Samples far from the cloud may have technical problems",
+       x = "Median log2 protein level", y = "Interquartile range") +
+  theme_qc()
+
+outlier_samples <- sample_stats$patientID[sample_stats$outlier]
+outlier_samples   # flagged for inspection, not removed automatically
+```
+
+`r length(outlier_samples)` sample(s) are flagged as outliers.
+
+# Protein variability
+
+Proteins with very low variability carry little information to distinguish patients. With
+about 200 proteins, all of them are usually kept: this section is descriptive.
+
+## Standard deviation of each protein
+
+Histogram of the standard deviation of each protein across samples, for total and
+phospho-specific proteins. The tables list the most and the least variable proteins.
+
+```{r}
+prot_stats <- data.frame(protein = colnames(prot),
+                         sd      = colSds(prot),
+                         phospho = ifelse(grepl("_p[STY]", colnames(prot)),
+                                          "Phospho-specific", "Total protein"))
+
+ggplot(prot_stats, aes(x = sd, fill = phospho)) +
+  geom_histogram(bins = 40, colour = "white") +
+  scale_fill_manual(values = c(`Total protein` = "#2C7FB8", `Phospho-specific` = "#D73027"),
+                    name = NULL) +
+  labs(title = "Variability of RPPA proteins",
+       subtitle = "Standard deviation of log2 relative levels across samples",
+       x = "Standard deviation across samples", y = "Proteins") +
+  theme_qc()
+
+# Most and least variable proteins
+head(prot_stats[order(prot_stats$sd, decreasing = TRUE), ], 10)
+head(prot_stats[order(prot_stats$sd), ], 10)
+```
+
+## Distribution across patients of random proteins
+
+Because the RPPA values are median-centred (all medians are close to 0), the proteins are
+stratified by their variability (tertiles of SD) instead of their mean level, and four random
+proteins are shown from each tertile.
+
+```{r}
+set.seed(1)
+strata <- cut(prot_stats$sd, quantile(prot_stats$sd, c(0, 1/3, 2/3, 1)),
+              labels = c("Low", "Medium", "High"), include.lowest = TRUE)
+names(strata) <- prot_stats$protein
+pick <- unlist(lapply(split(prot_stats$protein, strata), sample, size = 4))
+
+prot_df_long <- data.frame(protein = rep(pick, each = nrow(prot)),
+                           stratum = rep(strata[pick], each = nrow(prot)),
+                           value   = as.vector(prot[, pick]))
+prot_df_long$protein <- factor(prot_df_long$protein, levels = pick)
+
+ggplot(prot_df_long, aes(value, fill = stratum)) +
+  geom_histogram(bins = 25, colour = "white") +
+  facet_wrap(~ protein, scales = "free", ncol = 4) +
+  scale_fill_manual(values = c(Low = "#7FCDBB", Medium = "#2C7FB8", High = "#253494"),
+                    name = "Variability (SD)") +
+  labs(title = "Distribution across patients of randomly selected proteins",
+       subtitle = "4 random proteins per tertile of standard deviation",
+       x = "log2 relative protein level", y = "Patients") +
+  theme_classic(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"),
+        strip.text    = element_text(face = "bold"),
+        legend.position = "top")
+```
+
+# Duplicated or mixed-up samples
+
+Two different patients should never have near-identical protein profiles. Pairs of samples with
+a correlation above 0.99 would suggest a duplicated sample. The histogram shows, for each
+sample, its highest correlation with any other sample: values close to 1 suggest duplicates,
+and values far to the left a sample unlike any other.
+
+```{r}
+cor_mat <- cor(t(prot))                 # sample x sample correlation
+diag(cor_mat) <- NA                     # ignore self-correlation
+
+dup_pairs <- which(cor_mat > 0.99, arr.ind = TRUE)
+dup_pairs <- dup_pairs[dup_pairs[, 1] < dup_pairs[, 2], , drop = FALSE]   # each pair once
+data.frame(sample1 = rownames(cor_mat)[dup_pairs[, 1]],
+           sample2 = colnames(cor_mat)[dup_pairs[, 2]],
+           r       = cor_mat[dup_pairs])
+
+max_cor <- data.frame(patientID = rownames(cor_mat),
+                      max_r     = apply(cor_mat, 1, max, na.rm = TRUE))
+
+ggplot(max_cor, aes(x = max_r)) +
+  geom_histogram(bins = 50, fill = "grey60", colour = "white") +
+  labs(title = "Highest correlation with another sample",
+       subtitle = "All RPPA proteins; values near 1 suggest duplicated samples",
+       x = "Pearson r", y = "Samples") +
+  theme_qc()
+```
+
+`r nrow(dup_pairs)` pair(s) of samples have a correlation above 0.99.
+
+# Principal component analysis
+
+The PCA is **centred but not scaled**, because all proteins are on the same (log2 relative)
+scale.
+
+```{r}
+pc      <- prcomp(prot, center = TRUE, scale. = FALSE)
+var_exp <- round(100 * summary(pc)$importance[2, 1:2], 1)
+
+pca_df <- data.frame(PC1     = pc$x[, 1],
+                     PC2     = pc$x[, 2],
+                     stage   = clin[rownames(prot), "outcome_p.stage"],
+                     outlier = rownames(prot) %in% outlier_samples)
+```
+
+## PCA coloured by stage
+
+Shows whether the main sources of variation in the protein data are related to the outcome.
+
+```{r}
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = stage)) +
+  geom_point(size = 2, alpha = 0.7) +
+  labs(title = "PCA of RPPA protein levels",
+       x = paste0("PC1 (", var_exp[1], "%)"), y = paste0("PC2 (", var_exp[2], "%)"),
+       colour = "Stage") +
+  theme_qc() +
+  theme(legend.position = "right")
+```
+
+## PCA and outlier samples
+
+The outlier samples flagged above are highlighted. If they are also far from the rest in the
+PCA, their profile is globally different; if they are inside the cloud, the outlier flag is
+probably due to a few proteins only.
+
+```{r}
+ggplot(pca_df, aes(x = PC1, y = PC2, colour = outlier)) +
+  geom_point(size = 2, alpha = 0.7) +
+  scale_colour_manual(values = c(`FALSE` = "grey50", `TRUE` = "#D73027"),
+                      labels = c("Other samples", "Tukey outlier"), name = NULL) +
+  labs(title = "PCA of RPPA protein levels: outlier samples",
+       x = paste0("PC1 (", var_exp[1], "%)"), y = paste0("PC2 (", var_exp[2], "%)")) +
+  theme_qc() +
+  theme(legend.position = "right")
+```
+
+## Proteins that drive the first components
+
+The 10 proteins with the largest absolute loadings in PC1 and PC2.
+
+```{r}
+head(sort(abs(pc$rotation[, 1]), decreasing = TRUE), 10)
+head(sort(abs(pc$rotation[, 2]), decreasing = TRUE), 10)
+```
+
+# RNA–protein concordance (sample identity check)
+
+For several proteins measured both as RNA and as protein, the gene expression and the protein
+level of the same patient should be positively correlated. This is a check of **sample
+identity**: a patient whose RNA and protein disagree for several markers may be a sample swap.
+Protein names differ between panel versions, so the mapping between proteins and genes may
+need to be adjusted (see the comments in the code).
+
+```{r}
+do_rna_check <- TRUE
+if (do_rna_check) {
+  df  <- readRDS(file.path(path.x, "rna.train.rds"))
+  rna <- as.matrix(df[, colnames(df) != "patientID"])
+  rownames(rna) <- df$patientID
+  rm(df)
+  
+  # Find the antibody names of the markers in this dataset
+  grep("ER|PR|HER2|AR|GATA3|CDH1|E-Cad", colnames(prot), value = TRUE, ignore.case = TRUE)
+  
+  # Antibody -> gene mapping (adjust the antibody names to those found above)
+  markers <- c(`ER-alpha`   = "ESR1",
+               `PR`         = "PGR",
+               `HER2`       = "ERBB2",
+               `AR`         = "AR",
+               `GATA3`      = "GATA3",
+               `E-Cadherin` = "CDH1")
+  markers <- markers[names(markers) %in% colnames(prot) & markers %in% colnames(rna)]
+  
+  common <- intersect(rownames(prot), rownames(rna))
+  concord <- data.frame(antibody = names(markers),
+                        gene     = markers,
+                        r        = sapply(names(markers), function(a) {
+                          cor(prot[common, a], rna[common, markers[a]], method = "spearman")
+                        }))
+  concord   # expected: clearly positive correlations (e.g. ER, PR, HER2 > 0.6)
+  
+  # Scatter plots of protein vs. RNA for each marker
+  conc_df <- do.call(rbind, lapply(names(markers), function(a) {
+    data.frame(marker  = sprintf("%s (protein) vs %s (RNA)", a, markers[a]),
+               protein = prot[common, a],
+               rna     = rna[common, markers[a]])
+  }))
+  
+  ggplot(conc_df, aes(x = rna, y = protein)) +
+    geom_point(size = 1, alpha = 0.5) +
+    geom_smooth(method = "lm", se = FALSE, colour = "#D73027", linewidth = 0.6) +
+    facet_wrap(~ marker, scales = "free") +
+    labs(title = "RNA-protein concordance of breast cancer markers",
+         x = "log2(RSEM + 1)", y = "log2 relative protein level") +
+    theme_qc()
+}
+```
+
+Clearly positive correlations for the markers indicate that the RNA and protein samples come
+from the same patients.
+
+# Summary
+
+- **`r ncol(prot)` proteins and `r nrow(prot)` patients** are kept for the models; `r length(bad_samples)` low-quality sample(s) were removed.
+- `r length(outlier_samples)` sample(s) were flagged as outliers by their median or spread and kept.
+- `r if (nrow(dup_pairs) == 0) "No duplicated samples were detected (no pair of samples with r > 0.99)." else paste(nrow(dup_pairs), "pair(s) of samples with r > 0.99 should be checked as possible duplicates.")`
+
+# Save
+
+The filtered data and the QC parameters are written by the R script `02_qc_prot.R`. In this
+report the code is shown but **not run**, so that knitting does not overwrite the processed data
+(nor the model cache that depends on them).
+
+```{r, eval = FALSE}
+path.x <- "./data/processed"
+dir.create(path.x, showWarnings = FALSE, recursive = TRUE)
+
+prot_df <- data.frame(prot, check.names = FALSE)
+prot_df$patientID <- rownames(prot_df)
+prot_df <- prot_df[, c(ncol(prot_df), 1:(ncol(prot_df) - 1))]   # patientID as first column
+
+# QC parameters learned on train, to apply the same QC to test / Shiny data
+prot_qc_params <- list(
+  kept_proteins = colnames(prot),   # Proteins kept after filtering (step 4b)
+  max_na_sample = 0.05              # Max fraction of missing proteins per sample (step 3b)
+)
+
+saveRDS(prot_df, file.path(path.x, "prot.train.filtered.rds"))
+saveRDS(prot_qc_params, file.path(path.x, "prot_qc_params.rds"))   # QC parameters for test / Shiny
+```
+
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
