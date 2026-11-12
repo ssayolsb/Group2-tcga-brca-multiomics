@@ -7,6 +7,7 @@ multi-omics data of TCGA-BRCA (RNA-seq, RPPA protein and DNA methylation), and
 a Shiny app to train and compare models and to predict new patients with the
 uncertainty of every prediction.
 
+- **App:** <https://01a1d02a-f843-3606-72d2-82eaa15b98ad.share.connect.posit.cloud/>
 - **Code:** <https://github.com/ssayolsb/Group2-tcga-brca-multiomics>
 - **Licence:** MIT (see [LICENSE](LICENSE))
 
@@ -30,6 +31,11 @@ The files are numbered in the order of the analysis; each report in
 | 05 Reduced data for the app | `shinyapp/05_make_app_data.R` | – | `shinyapp/data/` (the files the app reads; in the repository) |
 | 06 Results of all the app models | `shinyapp/06_precompute_results.R` | "All results" tab of the app | `shinyapp/results/all_results.rds` |
 | App | `shinyapp/` | – | Shiny app |
+
+**Note:** the XGBoost and elastic net report (`reports/04_xgboost_elastic_net.html`)
+uses two data layers (RNA and protein). In the app, these models were extended to
+DNA methylation as a third layer, which can be used alone or together with RNA and
+protein.
 
 **General rule:** every data-driven step (QC filters, feature ranking, model
 fitting and tuning) is done on the training patients only and then applied

@@ -4,6 +4,8 @@ Interactive app to train and compare stage prediction models on RNA, protein
 and DNA methylation data, and to predict the pathological stage of a test
 patient with the uncertainty of the prediction.
 
+**Online app:** <https://01a1d02a-f843-3606-72d2-82eaa15b98ad.share.connect.posit.cloud/>
+
 > Course project for teaching and research. Not for clinical use.
 
 ## Files

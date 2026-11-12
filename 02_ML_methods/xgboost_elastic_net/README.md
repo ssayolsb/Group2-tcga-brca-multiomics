@@ -11,6 +11,10 @@ cross-validation (folds stratified by stage), and the six final models are
 evaluated on the same test patients, with bootstrap intervals, ROC curves and
 split conformal prediction sets (LAC, 90% target).
 
+**Note:** this report uses two data layers (RNA and protein). In the app, these
+models were extended to DNA methylation as a third layer, alone or together
+with RNA and protein.
+
 ## Input
 
 - `data/processed/rna.train.filtered.rds`, `prot.train.filtered.rds`, `prot_qc_params.rds`
