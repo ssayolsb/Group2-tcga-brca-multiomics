@@ -1,0 +1,372 @@
+---
+title: "TCGA-BRCA DIABLO multi-omics integration: pathological stage"
+subtitle: "mRNA, protein (RPPA) and DNA methylation"
+author: "`r params$author`"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: kable
+params:
+  n_genes: 2000             # number of mRNA genes kept
+  n_prot: 200               # number of proteins kept
+  n_meth: 5000              # number of methylation regions kept
+  seed: 20261027
+  project_dir: "../.."
+  author: "Yueling Peng"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 9, fig.height = 6)
+library(mixOmics)
+
+# Paths
+qc_dir    <- file.path(params$project_dir, "data/processed")
+split_dir <- file.path(params$project_dir, "data/data_split")
+n_cores   <- max(1, parallel::detectCores() - 1)
+
+# Read an rds file (patients as rows, first column patientID) into a numeric matrix
+# with patient IDs as row names
+to_matrix <- function(df) {
+  x <- as.matrix(df[, colnames(df) != "patientID"])
+  rownames(x) <- df$patientID
+  x
+}
+```
+
+# Overview
+
+This report uses DIABLO (mixOmics `block.splsda`) to integrate three omics layers of TCGA-BRCA and discriminate **pathological stage** (stage i / ii / iii). The model is trained on the training set and then validated on an independent test set.
+
+The inputs are the outputs of the QC pipeline (`scripts/01`–`02`) and the test-set preprocessing (`scripts/04_qc_test.R`):
+
+| Block | Training file | Test file | Values |
+|---|---|---|---|
+| mRNA | `rna.train.filtered.rds` | `rna.test.filtered.rds` | log2(CPM + 1) |
+| Protein | `prot.train.filtered.rds` | `prot.test.filtered.rds` | RPPA, log2 relative values |
+| Methylation | `meth.train.region_M.rds` | `meth.test.region_M.rds` | region-level M-values |
+
+Steps:
+
+1. Read the training set and check the patient order across the three blocks
+2. Pre-select features by variance (mRNA `r params$n_genes`, protein `r params$n_prot`, methylation `r params$n_meth`)
+3. Design matrix, number of components, keepX tuning, final model
+4. Result plots
+5. Prediction and evaluation on the test set
+6. Summary
+
+One rule applies throughout: **every data-driven choice (feature pre-selection, number of components, keepX) is made on the training set only**. The test set is used only for the final evaluation.
+
+# Training data
+
+## Read the three blocks
+
+```{r}
+# Step: read the three training blocks
+# Input: data/processed/*.train.*.rds
+# Output: rna, prot, meth (patient x feature matrices)
+rna  <- to_matrix(readRDS(file.path(qc_dir, "rna.train.filtered.rds")))
+prot <- to_matrix(readRDS(file.path(qc_dir, "prot.train.filtered.rds")))
+meth <- to_matrix(readRDS(file.path(qc_dir, "meth.train.region_M.rds")))
+```
+
+## Outcome
+
+Stage comes from `outcome_p.stage` in `clin.train.rds`, recoded from the AJCC pathological stage: stage i = i / ia / ib; stage ii = ii / iia / iib; stage iii = iiia / iiib / iiic / iv.
+
+```{r}
+# Step: read the outcome in the same patient order as rna
+# Input: clin.train.rds
+# Output: Y (factor); print the number of patients per class
+clin <- readRDS(file.path(split_dir, "clin.train.rds"))
+Y <- factor(clin[rownames(rna), "outcome_p.stage"])
+table(Y, useNA = "ifany")
+```
+
+## Checks
+
+```{r}
+# Step: check dimensions and patient order
+# Input: rna, prot, meth, Y
+# Output: print a table
+data.frame(check = c("mRNA patients x features", "Protein patients x features",
+                     "Methylation patients x features",
+                     "Same patient order: mRNA vs protein",
+                     "Same patient order: mRNA vs methylation",
+                     "Missing outcome values"),
+           value = c(paste(dim(rna), collapse = " x "), paste(dim(prot), collapse = " x "),
+                     paste(dim(meth), collapse = " x "),
+                     all(rownames(rna) == rownames(prot)),
+                     all(rownames(rna) == rownames(meth)),
+                     sum(is.na(Y))))
+```
+
+# Feature pre-selection
+
+For each block, the N features with the largest variance are kept. Variance is computed on the training set only and does not use the outcome. Methylation regions with missing values are removed first.
+
+```{r}
+# Step: remove methylation regions with NA
+# Input: meth
+# Output: meth (no NA); print dimensions
+meth <- meth[, colSums(is.na(meth)) == 0]
+dim(meth)
+```
+
+```{r}
+# Step: variance of every feature on the training set
+# Input: rna, prot, meth
+# Output: rna_var, prot_var, meth_var (named vectors)
+rna_var  <- matrixStats::colVars(rna,  useNames = TRUE)
+prot_var <- matrixStats::colVars(prot, useNames = TRUE)
+meth_var <- matrixStats::colVars(meth, useNames = TRUE)
+```
+
+```{r}
+# Step: keep the most variable features of each block as the DIABLO input
+# Input: rna, prot, meth and their variances
+# Output: X (list of three matrices)
+X <- list(mRNA        = rna[,  order(rna_var,  decreasing = TRUE)[1:params$n_genes]],
+          protein     = prot[, order(prot_var, decreasing = TRUE)[1:params$n_prot]],
+          methylation = meth[, order(meth_var, decreasing = TRUE)[1:params$n_meth]])
+data.frame(block = names(X), patients = sapply(X, nrow), features = sapply(X, ncol))
+```
+
+Region types among the methylation features (suffix `.promoter` / `.genebody` / `.island`):
+
+```{r}
+# Step: count methylation features by region type
+# Input: column names of X$methylation
+# Output: print a table
+table(sub(".*[.]", "", colnames(X$methylation)))
+```
+
+# DIABLO model
+
+## Design matrix
+
+The design matrix sets how strongly the blocks are required to correlate with each other. 0.1 is the value recommended by mixOmics; it favours discrimination of the outcome over correlation between blocks.
+
+```{r}
+# Step: 3 x 3 design matrix, 0.1 between blocks, 0 on the diagonal
+# Input: names of X
+# Output: design
+design <- matrix(0.1, nrow = length(X), ncol = length(X), dimnames = list(names(X), names(X)))
+diag(design) <- 0
+design
+```
+
+## Number of components
+
+A 5-component model without feature selection is fitted first. The number of components is chosen by 5-fold cross-validation repeated 5 times, as the one with the lowest balanced error rate (BER) under weighted vote and centroids distance. This takes 1–2 minutes.
+
+```{r}
+# Step: initial model without feature selection, plus cross-validation
+# Input: X, Y, design
+# Output: perf_init (error rates per number of components)
+diablo_init <- block.plsda(X, Y, ncomp = 5, design = design)
+perf_init <- perf(diablo_init, validation = "Mfold", folds = 5, nrepeat = 5,
+                  BPPARAM = BiocParallel::MulticoreParam(n_cores), seed = params$seed)
+plot(perf_init)
+```
+
+```{r}
+# Step: choose the number of components by BER (centroids distance)
+# Input: perf_init
+# Output: ncomp; print the number of components suggested for each distance
+perf_init$choice.ncomp$WeightedVote
+ncomp <- perf_init$choice.ncomp$WeightedVote["Overall.BER", "centroids.dist"]
+ncomp
+```
+
+## Tuning keepX
+
+For each block, several numbers of features per component are tested, and the combination with the lowest BER in 5-fold cross-validation (5 repeats) is kept. There are 4 × 4 × 4 = 64 combinations; this takes a few minutes. The message "Design matrix has changed to include Y" is expected and is not an error.
+
+```{r}
+# Step: tune keepX by cross-validation
+# Input: X, Y, design, ncomp
+# Output: tune; print the selected keepX
+test_keepX <- list(mRNA        = c(10, 25, 50, 100),
+                   protein     = c(5, 10, 20, 40),
+                   methylation = c(10, 25, 50, 100))
+tune <- tune.block.splsda(X, Y, ncomp = ncomp, test.keepX = test_keepX, design = design,
+                          validation = "Mfold", folds = 5, nrepeat = 5, dist = "centroids.dist",
+                          BPPARAM = BiocParallel::MulticoreParam(n_cores), seed = params$seed)
+tune$choice.keepX
+```
+
+## Final model
+
+```{r}
+# Step: fit the final model with the selected ncomp and keepX
+# Input: X, Y, design, ncomp, tune$choice.keepX
+# Output: diablo (block.splsda model)
+diablo <- block.splsda(X, Y, ncomp = ncomp, keepX = tune$choice.keepX, design = design)
+diablo
+```
+
+```{r}
+# Step: cross-validated error rates of the final model (training set)
+# Input: diablo
+# Output: perf_final; print error rates under weighted vote and centroids distance
+perf_final <- perf(diablo, validation = "Mfold", folds = 5, nrepeat = 5, dist = "centroids.dist",
+                   BPPARAM = BiocParallel::MulticoreParam(n_cores), seed = params$seed)
+perf_final$WeightedVote.error.rate$centroids.dist
+```
+
+# Result plots
+
+Correlation between the first components of the three blocks, and the distribution of patients on each block's component:
+
+```{r}
+# Step: DIABLO correlation plot (component 1)
+# Input: diablo
+# Output: plot
+plotDiablo(diablo, ncomp = 1)
+```
+
+```{r}
+# Step: sample plot (component 1 vs 2), coloured by stage
+# Input: diablo
+# Output: plot
+plotIndiv(diablo, ind.names = FALSE, legend = TRUE, title = "DIABLO sample plot")
+```
+
+Correlations between selected features across blocks (lines drawn only for |r| > 0.7):
+
+```{r, fig.width = 8, fig.height = 8}
+# Step: circos plot
+# Input: diablo
+# Output: plot
+circosPlot(diablo, cutoff = 0.7, line = TRUE, size.variables = 0.5)
+```
+
+```{r, fig.height = 10}
+# Step: loading plot for component 1 (coloured by the class with the largest median)
+# Input: diablo
+# Output: plot
+plotLoadings(diablo, comp = 1, contrib = "max", method = "median")
+```
+
+Top features on component 1 in each block (largest absolute loadings):
+
+```{r}
+# Step: 10 features with the largest absolute loading on component 1, per block
+# Input: diablo$loadings
+# Output: print a table
+do.call(rbind, lapply(names(X), function(block) {
+  L <- diablo$loadings[[block]][, 1]
+  L <- L[L != 0]
+  top <- head(L[order(abs(L), decreasing = TRUE)], 10)
+  data.frame(block = block, feature = names(top), loading = round(unname(top), 3))
+}))
+```
+
+# Test set validation
+
+The test set (`scripts/04_qc_test.R`) was processed with all QC parameters learned on the training set. Here only the features used in training are taken.
+
+```{r}
+# Step: read the test set, keep the training features and patients present in all three blocks
+# Input: data/processed/*.test.*.rds, X
+# Output: X_test (list)
+rna_test  <- to_matrix(readRDS(file.path(qc_dir, "rna.test.filtered.rds")))
+prot_test <- to_matrix(readRDS(file.path(qc_dir, "prot.test.filtered.rds")))
+meth_test <- to_matrix(readRDS(file.path(qc_dir, "meth.test.region_M.rds")))
+patients_test <- Reduce(intersect, list(rownames(rna_test), rownames(prot_test), rownames(meth_test)))
+X_test <- list(mRNA        = rna_test[patients_test,  colnames(X$mRNA)],
+               protein     = prot_test[patients_test, colnames(X$protein)],
+               methylation = meth_test[patients_test, colnames(X$methylation)])
+```
+
+```{r}
+# Step: dimensions and missing values of the test set
+# Input: X_test
+# Output: print a table
+data.frame(block = names(X_test), patients = sapply(X_test, nrow),
+           features = sapply(X_test, ncol), missing_values = sapply(X_test, function(x) sum(is.na(x))))
+```
+
+```{r}
+# Step: true stage of the test patients (same levels as training)
+# Input: clin.test.rds
+# Output: Y_test; print the number of patients per class
+clin_test <- readRDS(file.path(split_dir, "clin.test.rds"))
+Y_test <- factor(clin_test[patients_test, "outcome_p.stage"], levels = levels(Y))
+table(Y_test, useNA = "ifany")
+```
+
+Prediction uses the same settings as the cross-validation: weighted vote and centroids distance.
+
+```{r}
+# Step: predict the test set
+# Input: diablo, X_test
+# Output: pred; pred_class (patient x component predicted classes)
+pred <- predict(diablo, newdata = X_test, dist = "centroids.dist")
+pred_class <- pred$WeightedVote$centroids.dist
+```
+
+```{r}
+# Step: BER on the test set vs training cross-validation, per number of components
+# Input: pred_class, Y_test, perf_final
+# Output: print a table
+test_ber <- apply(pred_class, 2, function(p) get.BER(get.confusion_matrix(truth = Y_test, predicted = p)))
+data.frame(component = seq_len(ncomp),
+           train_cv_BER = perf_final$WeightedVote.error.rate$centroids.dist["Overall.BER", ],
+           test_BER = test_ber)
+```
+
+Confusion matrix with the final number of components (rows = true class, columns = predicted class):
+
+```{r}
+# Step: confusion matrix
+# Input: last column of pred_class, Y_test
+# Output: print the confusion matrix
+get.confusion_matrix(truth = Y_test, predicted = pred_class[, ncomp])
+```
+
+# Summary
+
+```{r}
+# Step: main results
+# Input: Y, Y_test, ncomp, perf_final, test_ber, pred_class
+# Output: print a table
+chance_ber    <- 1 - 1 / nlevels(Y)
+train_ber     <- perf_final$WeightedVote.error.rate$centroids.dist["Overall.BER", ncomp]
+test_accuracy <- mean(pred_class[, ncomp] == Y_test)
+majority_rate <- max(table(Y_test)) / length(Y_test)
+data.frame(item = c("Training patients", "Test patients", "Components",
+                    "Train CV BER (final component)", "Test BER (final component)",
+                    "Chance-level BER (3 classes)", "Test accuracy (final component)",
+                    "Accuracy of always predicting the largest class"),
+           value = as.character(c(length(Y), length(Y_test), ncomp,
+                                  round(train_ber, 3), round(test_ber[ncomp], 3), round(chance_ber, 3),
+                                  round(test_accuracy, 3), round(majority_rate, 3))))
+```
+
+**Model.** DIABLO integrated `r params$n_genes` mRNA genes, `r params$n_prot` proteins and `r params$n_meth` methylation regions from `r length(Y)` training patients. Cross-validation selected `r ncomp` components and kept `r sum(unlist(tune$choice.keepX))` features in total (mRNA `r sum(tune$choice.keepX$mRNA)`, protein `r sum(tune$choice.keepX$protein)`, methylation `r sum(tune$choice.keepX$methylation)`).
+
+**Performance.** The balanced error rate was `r round(train_ber, 3)` in training cross-validation and `r round(test_ber[ncomp], 3)` on the `r length(Y_test)` test patients, against a chance level of `r round(chance_ber, 3)` for three classes. The model is only slightly better than chance: **pathological stage cannot be reliably predicted from these molecular profiles**. The overall test accuracy (`r round(test_accuracy, 3)`) is even lower than always predicting the largest class, stage ii (`r round(majority_rate, 3)`), because the model is tuned on BER and spreads its predictions over all three classes. The test BER is close to the cross-validation BER, so the model does not overfit; the signal for stage is simply weak.
+
+**Biology.** Component 1 is driven by the luminal programme: ER-alpha and GATA3 in the protein block, and FOXA1, MLPH and SPDEF in the mRNA block. This axis separates luminal from basal-like tumours, i.e. it reflects molecular subtype rather than stage. This fits the known biology: stage is defined by tumour size, lymph-node involvement and metastasis (TNM), which depend mainly on how long the tumour has grown and when it was detected, not on a distinct expression or methylation profile of the bulk tumour.
+
+**Limitations.**
+
+- The classes are imbalanced (stage ii is the largest), which limits the accuracy for stage i and iii.
+- Stage iv patients are merged into stage iii, and stage substages (e.g. iia vs iib) are not modelled.
+- Features were pre-selected by variance without using the outcome, so features weakly related to stage but with low variance may have been removed.
+
+**Conclusion.** The data and pipeline work as intended (consistent performance between cross-validation and test set, no leakage from test to training), but pathological stage is not a suitable outcome for molecular discrimination in TCGA-BRCA. Molecular subtype (e.g. PAM50) or survival-related endpoints are more suitable targets for DIABLO.
+
+# Session information
+
+```{r}
+# Step: session information
+# Input: none
+# Output: print
+sessionInfo()
+```

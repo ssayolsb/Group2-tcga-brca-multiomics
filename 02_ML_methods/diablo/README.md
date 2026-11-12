@@ -1,7 +1,7 @@
 # 04 Models: DIABLO
 
 **Report:** [`reports/04_diablo.html`](../../reports/04_diablo.html)
-**Code:** `04_diablo.Rmd` (R Markdown) – *to be added*
+**Code:** `04_diablo.Rmd` (R Markdown)
 
 ## What it does
 
