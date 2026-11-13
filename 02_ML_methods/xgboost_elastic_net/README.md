@@ -1,7 +1,7 @@
 # 04 Models: XGBoost and elastic net
 
 **Report:** [`reports/04_xgboost_elastic_net.html`](../../reports/04_xgboost_elastic_net.html)
-**Code:** `04_xgboost_elastic_net.qmd` (Quarto) – *to be added*
+**Code:** `04_xgboost_elastic_net.qmd` (Quarto)
 
 ## What it does
 

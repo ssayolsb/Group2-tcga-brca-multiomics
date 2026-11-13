@@ -1,0 +1,663 @@
+---
+title: "Breast cancer stage prediction from RNA and protein"
+subtitle: "XGBoost and elastic-net logistic regression in TCGA-BRCA"
+format:
+  html:
+    theme: flatly
+    toc: true
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+execute:
+  message: false
+  cache: false
+---
+
+## Research question
+
+Does combining tumour RNA expression with protein abundance improve the prediction of pathological Stage I, Stage II, and Stage III/IV? We fit XGBoost and multinomial elastic-net logistic regression separately to RNA, protein, and their combined predictors. The six models share training folds, calibration patients, and test patients. We compare single-stage predictions and conformal sets of plausible stages.
+
+## Data sources and inputs
+
+The existing data preparation script retrieved TCGA-BRCA through `curatedTCGAData` 2.1.1 and ExperimentHub. The cohort includes female patients with primary tumours, an observed pathological stage, and RNA, protein, and methylation measurements. The report uses RNA and protein as predictors and retains the original patient-level 70/30 split. [curatedTCGAData documentation](https://waldronlab.io/curatedTCGAData/reference/curatedTCGAData.html)
+
+| Input | Saved files under `data/` | Use |
+|---|---|---|
+| RNA expression | `processed/rna.train.filtered.rds`<br>`data_split/rna.test.rds` | Filtered training genes and holdout gene expression on the log2 per-million scale |
+| Protein abundance | `processed/prot.train.filtered.rds`<br>`data_split/prot.test.rds` | Filtered training markers and holdout abundance on the normalized reverse-phase protein array (RPPA) scale |
+| Original protein training split and saved QC settings | `data_split/prot.train.rds`<br>`processed/prot_qc_params.rds` | Recover the training-derived sample missingness screen |
+| Clinical records | `data_split/clin.train.rds`<br>`data_split/clin.test.rds` | Match patients to their observed pathological stage |
+
+### Set up R and read the assay matrices
+
+Each assay file has one row per patient. Check that its patient IDs and feature names are unique, then separate the ID column from the numeric predictor matrix.
+
+```{r}
+#| label: setup
+suppressPackageStartupMessages(suppressWarnings(library(ggplot2)))
+theme_set(theme_minimal(base_size = 12))
+percent <- scales::label_percent(accuracy = 0.1)
+stages <- c("Stage I", "Stage II", "Stage III/IV")
+assays <- c("RNA", "Protein", "RNA + Protein")
+families <- c("XGBoost", "Elastic net")
+data_dir <- if (dir.exists("data/data_split")) "data" else "../../data"
+
+read_input <- function(path) readRDS(file.path(data_dir, path))
+
+read_assay <- function(path) {
+  data <- read_input(path)
+  stopifnot(identical(data$patientID, rownames(data)), !anyNA(data$patientID),
+            !anyDuplicated(data$patientID), !anyDuplicated(names(data)))
+  values <- as.matrix(data[, names(data) != "patientID", drop = FALSE])
+  stopifnot(is.numeric(values), !any(is.infinite(values)))
+  values
+}
+```
+
+### Align both assays by patient
+
+Use the supplied filtered training matrices. For the holdout, apply the protein sample screen derived from the original training split and keep the columns present in the filtered training matrices. Matching by patient ID and feature name gives both model families identical inputs.
+
+```{r}
+#| label: align-assays
+rna_train <- read_assay("processed/rna.train.filtered.rds")
+prot_train <- read_assay("processed/prot.train.filtered.rds")
+rna_holdout <- read_assay("data_split/rna.test.rds")
+prot_holdout <- read_assay("data_split/prot.test.rds")
+prot_original <- read_assay("data_split/prot.train.rds")
+prot_qc <- read_input("processed/prot_qc_params.rds")
+
+screen_panel <- colnames(prot_original)[colMeans(is.na(prot_original)) <= 0.20]
+passes_screen <- rowMeans(is.na(prot_holdout[, screen_panel, drop = FALSE])) <=
+  prot_qc$max_na_sample
+train_ids <- intersect(rownames(rna_train), rownames(prot_train))
+holdout_ids <- intersect(rownames(rna_holdout), rownames(prot_holdout)[passes_screen])
+stopifnot(!any(train_ids %in% holdout_ids),
+          identical(colnames(prot_train), prot_qc$kept_proteins))
+
+rna_train <- rna_train[train_ids, , drop = FALSE]
+prot_train <- prot_train[train_ids, , drop = FALSE]
+rna_holdout <- rna_holdout[holdout_ids, colnames(rna_train), drop = FALSE]
+prot_holdout <- prot_holdout[holdout_ids, colnames(prot_train), drop = FALSE]
+stopifnot(!anyNA(rna_train), !anyNA(rna_holdout))
+```
+
+### Define the outcome
+
+Map the recorded pathological substages to the three target classes. Check the mapping against the saved grouped outcome, which records Stage III/IV as `stage iii`. Clinical records supply the labels.
+
+```{r}
+#| label: stage-labels
+stage_map <- c(
+  setNames(rep(stages[1], 3), c("stage i", "stage ia", "stage ib")),
+  setNames(rep(stages[2], 3), c("stage ii", "stage iia", "stage iib")),
+  setNames(rep(stages[3], 5), c("stage iii", "stage iiia", "stage iiib", "stage iiic", "stage iv"))
+)
+
+read_stage <- function(path, ids) {
+  clinical <- read_input(path)
+  stopifnot(identical(clinical$patientID, rownames(clinical)),
+            all(ids %in% rownames(clinical)))
+  clinical <- clinical[ids, , drop = FALSE]
+  labels <- unname(stage_map[as.character(clinical$pathologic_stage)])
+  saved <- match(clinical$outcome_p.stage, c("stage i", "stage ii", "stage iii"))
+  stopifnot(!anyNA(labels), identical(labels, stages[saved]))
+  factor(labels, levels = stages)
+}
+
+y_train <- read_stage("data_split/clin.train.rds", train_ids)
+```
+
+## Shared training design
+
+### Reserve calibration and test patients
+
+Split the eligible original holdout into calibration and final test subsets using the same seed and fraction as the app. Model settings and feature counts are selected exclusively within the filtered training cohort. Calibration and test labels are read when their respective results are calculated.
+
+```{r}
+#| label: partitions
+set.seed(20261109)
+cal_ids <- sample(holdout_ids, size = round(0.40 * length(holdout_ids)))
+test_ids <- setdiff(holdout_ids, cal_ids)
+stopifnot(!anyDuplicated(c(train_ids, cal_ids, test_ids)))
+```
+
+### Prepare the predictor panels
+
+Within each fitting fold, rank RNA genes by variance and estimate any protein imputation medians. The RNA-only models select their gene count through cross-validation. Protein uses all variable markers. The integrated panel keeps the same number of genes as markers, with the two assays concatenated by patient. The supplied QC filters were learned on the full training cohort, so fold comparisons are conditional on those initial filters.
+
+```{r}
+#| label: prepare-predictors
+rna_counts <- c(216L, 500L, 1000L, 2000L)
+
+impute_protein <- function(values, medians) {
+  missing <- which(is.na(values), arr.ind = TRUE)
+  values[missing] <- medians[missing[, "col"]]
+  values
+}
+
+make_panels <- function(rna, protein, genes, markers) {
+  stopifnot(identical(rownames(rna), rownames(protein)))
+  rna <- rna[, genes, drop = FALSE]
+  protein <- protein[, markers, drop = FALSE]
+  colnames(rna) <- paste0("RNA__", genes)
+  colnames(protein) <- paste0("RPPA__", markers)
+  integrated <- cbind(rna[, seq_along(markers), drop = FALSE], protein)
+  setNames(list(rna, protein, integrated), assays)
+}
+
+prepare_predictors <- function(fit_rows, new_rna, new_protein) {
+  rna <- rna_train[fit_rows, , drop = FALSE]
+  protein <- prot_train[fit_rows, , drop = FALSE]
+  medians <- matrixStats::colMedians(protein, na.rm = TRUE)
+  stopifnot(all(is.finite(medians)))
+  protein <- impute_protein(protein, medians)
+  new_protein <- impute_protein(new_protein, medians)
+
+  protein_variance <- matrixStats::colVars(protein)
+  markers <- names(protein_variance)[protein_variance > 0]
+  rna_variance <- sort(matrixStats::colVars(rna), decreasing = TRUE)
+  max_genes <- max(rna_counts, length(markers))
+  stopifnot(length(markers) > 0, sum(rna_variance > 0) >= max_genes)
+  genes <- names(head(rna_variance, max_genes))
+
+  list(fit = make_panels(rna, protein, genes, markers),
+       new = make_panels(new_rna, new_protein, genes, markers))
+}
+
+take_features <- function(x, count) x[, seq_len(count), drop = FALSE]
+```
+
+### Create shared validation folds
+
+Use five stage-stratified folds and mean validation balanced accuracy to choose settings. Balanced accuracy gives equal weight to recall for all stages. Both model families use inverse-frequency weights estimated within each fit, so each stage contributes equal total weight to the fitting objective.
+
+```{r}
+#| label: training-folds
+n_folds <- 5L
+stopifnot(all(table(y_train) >= n_folds))
+set.seed(20261110)
+fold_id <- integer(length(y_train))
+for (rows in split(seq_along(y_train), y_train)) {
+  fold_id[sample(rows)] <- rep(seq_len(n_folds), length.out = length(rows))
+}
+
+folds <- lapply(seq_len(n_folds), function(fold) {
+  fit <- which(fold_id != fold)
+  valid <- which(fold_id == fold)
+  panels <- prepare_predictors(fit, rna_train[valid, , drop = FALSE],
+                               prot_train[valid, , drop = FALSE])
+  list(x_fit = panels$fit, x_valid = panels$new, y_fit = y_train[fit], y_valid = y_train[valid])
+})
+
+stage_weights <- function(y) {
+  weights <- 1 / as.numeric(table(y)[as.character(y)])
+  weights / mean(weights)
+}
+
+pick_stage <- function(scores) {
+  factor(stages[max.col(scores[, stages, drop = FALSE], ties.method = "first")], levels = stages)
+}
+
+balanced_accuracy <- function(observed, predicted) {
+  counts <- table(observed, predicted)
+  mean(diag(counts) / rowSums(counts))
+}
+
+# Apply either model's validation scorer to each fold and feature count.
+score_folds <- function(assay, scorer) {
+  do.call(rbind, lapply(folds, function(fold) {
+    x <- fold$x_fit[[assay]]
+    x_valid <- fold$x_valid[[assay]]
+    counts <- if (assay == "RNA") rna_counts else ncol(x)
+    do.call(rbind, lapply(counts, function(count) {
+      scores <- scorer(take_features(x, count), fold$y_fit,
+                       take_features(x_valid, count), fold$y_valid)
+      data.frame(Features = count, scores)
+    }))
+  }))
+}
+
+# Prepare the full training and holdout matrices once using training data.
+final_panels <- prepare_predictors(seq_along(y_train), rna_holdout, prot_holdout)
+```
+
+## Build XGBoost models
+
+XGBoost grows trees sequentially to reduce multiclass prediction loss. Tune tree depth and the number of boosting rounds. For RNA alone, tune the gene count jointly with those settings. The learning rate stays at 0.05, and we reuse each fitted tree sequence to evaluate shorter round counts. [XGBoost R documentation](https://cran.r-project.org/web/packages/xgboost/refman/xgboost.html)
+
+```{r}
+#| label: xgboost-functions
+depths <- c(1L, 3L)
+rounds <- c(50L, 100L, 200L)
+
+xgb_matrix <- function(x, y) {
+  # XGBoost expects zero-based class IDs in factor level order.
+  xgboost::xgb.DMatrix(x, label = as.integer(y) - 1L,
+                      weight = stage_weights(y), nthread = 2)
+}
+
+fit_xgb <- function(data, depth, n_rounds) {
+  xgboost::xgb.train(
+    params = list(objective = "multi:softprob", num_class = length(stages),
+                  max_depth = depth, eta = 0.05, tree_method = "hist", nthread = 2),
+    data = data, nrounds = n_rounds, verbose = 0
+  )
+}
+
+xgb_scores <- function(model, new_data, n_rounds) {
+  scores <- predict(model, new_data, iterationrange = c(1L, n_rounds), strict_shape = TRUE)
+  colnames(scores) <- stages
+  scores
+}
+
+score_xgb <- function(x, y, x_valid, y_valid) {
+  train_data <- xgb_matrix(x, y)
+  valid_data <- xgboost::xgb.DMatrix(x_valid, nthread = 2)
+  do.call(rbind, lapply(depths, function(depth) {
+    model <- fit_xgb(train_data, depth, max(rounds))
+    scores <- vapply(rounds, function(n_rounds) {
+      balanced_accuracy(y_valid, pick_stage(xgb_scores(model, valid_data, n_rounds)))
+    }, numeric(1))
+    data.frame(Depth = depth, Rounds = rounds, Balanced = scores)
+  }))
+}
+```
+
+Select the setting with the highest mean validation balanced accuracy for each assay. For ties, prefer fewer features, shallower trees, and then fewer rounds. Refit the selected models on all training patients.
+
+```{r}
+#| label: xgboost-train
+xgb_models <- setNames(lapply(assays, function(assay) {
+  scores <- score_folds(assay, score_xgb)
+  means <- aggregate(Balanced ~ Features + Depth + Rounds, scores, mean)
+  best <- means[order(-means$Balanced, means$Features, means$Depth, means$Rounds)[1], ]
+  x <- take_features(final_panels$fit[[assay]], best$Features)
+  model <- fit_xgb(xgb_matrix(x, y_train), best$Depth, best$Rounds)
+  list(fit = model, settings = best)
+}), assays)
+
+xgb_settings <- do.call(rbind, lapply(xgb_models, function(model) model$settings))
+xgb_settings$Balanced <- percent(xgb_settings$Balanced)
+names(xgb_settings)[4] <- "Validation balanced accuracy"
+knitr::kable(xgb_settings, caption = "Selected XGBoost settings and feature counts.")
+```
+
+## Build elastic-net models with glmnet
+
+Fit multinomial logistic regression with an elastic-net penalty. Tune the mixing parameter and penalty strength, along with the gene count for RNA alone. `glmnet` standardizes the predictors within each fit. Its grouped penalty can shrink a feature's coefficients for all three stages to zero together. The selected panel size counts predictors supplied to the model. [glmnet documentation](https://search.r-project.org/CRAN/refmans/glmnet/html/glmnet.html)
+
+```{r}
+#| label: glmnet-functions
+alphas <- c(0.25, 0.50, 0.75)
+lambdas <- 10^seq(-0.5, -3, length.out = 12)
+
+fit_enet <- function(x, y, alpha) {
+  model <- glmnet::glmnet(x, y, family = "multinomial", type.multinomial = "grouped",
+                          weights = stage_weights(y), alpha = alpha, lambda = lambdas)
+  stopifnot(isTRUE(all.equal(model$lambda, lambdas)))
+  model
+}
+
+score_enet <- function(x, y, x_valid, y_valid) {
+  do.call(rbind, lapply(alphas, function(alpha) {
+    model <- fit_enet(x, y, alpha)
+    probabilities <- predict(model, newx = x_valid, s = lambdas, type = "response")
+    scores <- vapply(seq_along(lambdas), function(i) {
+      balanced_accuracy(y_valid, pick_stage(probabilities[, , i]))
+    }, numeric(1))
+    data.frame(Alpha = alpha, Lambda = lambdas, Balanced = scores)
+  }))
+}
+```
+
+Select the setting with the highest mean validation balanced accuracy for each assay. For ties, prefer fewer features, a larger penalty, and then a mixing parameter closer to 0.5. Refit the selected models on all training patients.
+
+```{r}
+#| label: glmnet-train
+enet_models <- setNames(lapply(assays, function(assay) {
+  scores <- score_folds(assay, score_enet)
+  means <- aggregate(Balanced ~ Features + Alpha + Lambda, scores, mean)
+  best <- means[order(-means$Balanced, means$Features, -means$Lambda,
+                      abs(means$Alpha - 0.5))[1], ]
+  x <- take_features(final_panels$fit[[assay]], best$Features)
+  list(fit = fit_enet(x, y_train, best$Alpha), settings = best)
+}), assays)
+
+enet_settings <- do.call(rbind, lapply(enet_models, function(model) model$settings))
+enet_settings$Balanced <- percent(enet_settings$Balanced)
+names(enet_settings)[4] <- "Validation balanced accuracy"
+knitr::kable(enet_settings, digits = 4, caption = "Selected elastic-net settings and feature counts.")
+```
+
+## Held-out results
+
+### Compare the six models
+
+Score the final test patients with the six fitted models and assign each patient the stage with the highest score. Report accuracy, balanced accuracy, and macro F1, which gives each stage equal weight when averaging F1. The majority-stage baseline always predicts the most common training stage.
+
+```{r}
+#| label: test-metrics
+y_test <- read_stage("data_split/clin.test.rds", test_ids)
+stopifnot(all(table(y_test) > 0))
+counts <- rbind(Training = table(y_train), Test = table(y_test))
+knitr::kable(cbind(counts, Total = rowSums(counts)), caption = "Patient counts by stage and split.")
+
+model_grid <- expand.grid(Model = families, Assay = assays, stringsAsFactors = FALSE)
+model_grid$ID <- paste(model_grid$Model, model_grid$Assay, sep = " / ")
+
+predict_models <- function(ids) {
+  scores <- lapply(seq_len(nrow(model_grid)), function(i) {
+    assay <- model_grid$Assay[i]
+    new_x <- final_panels$new[[assay]][ids, , drop = FALSE]
+    if (model_grid$Model[i] == "XGBoost") {
+      model <- xgb_models[[assay]]
+      new_x <- take_features(new_x, model$settings$Features)
+      new_data <- xgboost::xgb.DMatrix(new_x, nthread = 2)
+      probabilities <- xgb_scores(model$fit, new_data, model$settings$Rounds)
+    } else {
+      model <- enet_models[[assay]]
+      new_x <- take_features(new_x, model$settings$Features)
+      probabilities <- predict(model$fit, newx = new_x, s = model$settings$Lambda,
+                               type = "response")[, , 1]
+    }
+    probabilities <- probabilities[, stages, drop = FALSE]
+    stopifnot(nrow(probabilities) == length(ids), all(is.finite(probabilities)),
+              all(abs(rowSums(probabilities) - 1) < 1e-6))
+    probabilities
+  })
+  setNames(scores, model_grid$ID)
+}
+
+test_scores <- predict_models(test_ids)
+predictions <- lapply(test_scores, pick_stage)
+
+majority <- stages[which.max(table(y_train))]
+predictions[["Majority baseline"]] <- factor(rep(majority, length(y_test)), levels = stages)
+confusions <- lapply(predictions, function(pred) table(Observed = y_test, Predicted = pred))
+metrics <- t(vapply(confusions, function(cm) {
+  correct <- diag(cm)
+  c(Accuracy = sum(correct) / sum(cm),
+    `Balanced accuracy` = mean(correct / rowSums(cm)),
+    `Macro F1` = mean(2 * correct / (rowSums(cm) + colSums(cm))))
+}, numeric(3)))
+metric_table <- matrix(percent(metrics), nrow = nrow(metrics), dimnames = dimnames(metrics))
+knitr::kable(metric_table, caption = "Point predictions on the common test set.")
+```
+
+### Compare balanced accuracy with uncertainty
+
+Resample test patients within each observed stage. Use the same resampled patients for all models, so the intervals reflect test-set variation and preserve the pairing between predictions. The dashed line marks the majority baseline, which has one correct class out of three when recall is averaged across classes.
+
+```{r}
+#| label: fig-balanced-accuracy
+#| fig-cap: "Test balanced accuracy with 95% stage-stratified bootstrap intervals based on 2,000 resamples."
+#| fig-alt: "Two dots per assay show balanced accuracy for XGBoost and elastic net, with horizontal intervals and a baseline reference."
+#| fig-width: 8
+#| fig-height: 4.1
+correct <- vapply(predictions[model_grid$ID], function(pred) pred == y_test,
+                  logical(length(y_test)))
+stage_rows <- split(seq_along(y_test), y_test)
+
+score_resample <- function(rows_by_stage) {
+  recall <- lapply(rows_by_stage, function(rows) colMeans(correct[rows, , drop = FALSE]))
+  Reduce("+", recall) / length(stages)
+}
+
+set.seed(20261111)
+bootstrap <- replicate(2000, {
+  sampled <- lapply(stage_rows, function(rows) {
+    rows[sample.int(length(rows), replace = TRUE)]
+  })
+  score_resample(sampled)
+})
+
+performance <- transform(model_grid,
+  Estimate = metrics[ID, "Balanced accuracy"],
+  Lower = apply(bootstrap, 1, quantile, 0.025),
+  Upper = apply(bootstrap, 1, quantile, 0.975),
+  Assay = factor(Assay, levels = rev(assays))
+)
+dodge <- position_dodge(width = 0.48, orientation = "y")
+ggplot(performance, aes(Estimate, Assay, colour = Model)) +
+  geom_vline(xintercept = 1 / length(stages), linetype = "dashed", colour = "grey45") +
+  geom_linerange(aes(xmin = Lower, xmax = Upper), position = dodge, linewidth = 0.8) +
+  geom_point(position = dodge, size = 2.8) +
+  scale_colour_manual(values = c(XGBoost = "#176084", `Elastic net` = "#A65028")) +
+  scale_x_continuous(labels = scales::label_percent()) +
+  labs(x = "Test balanced accuracy", y = NULL, colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+### Inspect errors by stage
+
+The diagonal of each confusion matrix shows which patients were classified correctly. Cell labels show counts, and colour is normalized within the observed stage so that rare and common stages can be compared.
+
+```{r}
+#| label: fig-confusion
+#| fig-cap: "Confusion matrices by model family and assay. Numbers show patient counts and colour shows the share within each observed stage."
+#| fig-alt: "Six heatmaps show predicted stage against observed stage for each model and assay."
+#| fig-width: 10
+#| fig-height: 6.3
+confusion_plot <- do.call(rbind, lapply(seq_len(nrow(model_grid)), function(i) {
+  cm <- confusions[[model_grid$ID[i]]]
+  data.frame(as.data.frame(cm, responseName = "Count"),
+             Fraction = as.vector(prop.table(cm, margin = 1)),
+             Model = model_grid$Model[i], Assay = model_grid$Assay[i])
+}))
+confusion_plot$Model <- factor(confusion_plot$Model, levels = families)
+confusion_plot$Assay <- factor(confusion_plot$Assay, levels = assays)
+
+ggplot(confusion_plot, aes(Predicted, Observed, fill = Fraction)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = Count, colour = Fraction > 0.55), size = 4) +
+  scale_colour_manual(values = c("TRUE" = "white", "FALSE" = "grey10"), guide = "none") +
+  scale_fill_gradient(low = "#EDF5F8", high = "#176084", limits = c(0, 1),
+                      labels = scales::label_percent(), name = "Within stage") +
+  guides(fill = guide_colourbar(barwidth = grid::unit(5, "cm"))) +
+  scale_y_discrete(limits = rev(stages)) +
+  facet_grid(Model ~ Assay) +
+  labs(x = "Predicted stage", y = "Observed stage") +
+  theme(panel.grid = element_blank(), legend.position = "bottom")
+```
+
+### Compare ROC curves and AUC
+
+For each model, plot one receiver operating characteristic (ROC) curve per stage. Each curve treats that stage as the positive class and the other two as the negative class. As the score threshold varies, the curve shows how the true positive rate trades off against the false positive rate. The diagonal corresponds to an area under the curve (AUC) of 0.5. Macro AUC averages the three stage-specific AUC values with equal weight. These calculations use the same final test patients as the confusion matrices. [pROC documentation](https://search.r-project.org/CRAN/refmans/pROC/help/roc.html)
+
+```{r}
+#| label: roc-auc
+roc_curves <- lapply(test_scores, function(scores) {
+  setNames(lapply(stages, function(stage) {
+    # Fix the direction so higher model scores always favour the candidate stage.
+    pROC::roc(response = as.integer(y_test == stage), predictor = scores[, stage],
+              levels = c(0, 1), direction = "<", quiet = TRUE)
+  }), stages)
+})
+
+auc_values <- t(vapply(roc_curves, function(curves) {
+  vapply(curves, function(curve) as.numeric(pROC::auc(curve)), numeric(1))
+}, numeric(length(stages))))
+knitr::kable(cbind(auc_values, `Macro AUC` = rowMeans(auc_values)), digits = 3,
+             caption = "One-vs-rest AUC for each stage and its macro average on the final test set.")
+```
+
+Plot the same three stage curves in each panel to compare model families and assay inputs.
+
+```{r}
+#| label: fig-roc
+#| fig-cap: "Held-out one-vs-rest ROC curves for XGBoost and elastic net across the three assay inputs. The dashed grey line indicates chance ranking."
+#| fig-alt: "Six panels show true positive rate versus false positive rate, with a curve for each pathological stage."
+#| fig-width: 9
+#| fig-height: 6.8
+roc_plot <- do.call(rbind, lapply(seq_len(nrow(model_grid)), function(i) {
+  curves <- roc_curves[[model_grid$ID[i]]]
+  do.call(rbind, lapply(stages, function(stage) {
+    points <- pROC::coords(curves[[stage]], x = "all",
+                           ret = c("specificity", "sensitivity"), transpose = FALSE)
+    data.frame(Model = model_grid$Model[i], Assay = model_grid$Assay[i],
+               Stage = stage, FPR = 1 - points$specificity, TPR = points$sensitivity)
+  }))
+}))
+roc_plot$Model <- factor(roc_plot$Model, levels = families)
+roc_plot$Assay <- factor(roc_plot$Assay, levels = assays)
+roc_plot$Stage <- factor(roc_plot$Stage, levels = stages)
+
+ggplot(roc_plot, aes(FPR, TPR, colour = Stage, linetype = Stage)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey55") +
+  geom_path(linewidth = 0.8) +
+  facet_grid(Model ~ Assay) +
+  scale_colour_manual(values = c("#176084", "#A65028", "#22765B")) +
+  scale_linetype_manual(values = c("solid", "longdash", "dotdash")) +
+  scale_x_continuous(breaks = c(0, 0.5, 1)) +
+  scale_y_continuous(breaks = c(0, 0.5, 1)) +
+  coord_equal() +
+  labs(x = "False positive rate", y = "True positive rate") +
+  theme(legend.position = "bottom")
+```
+
+### Compare integrated and standalone configurations
+
+For each model family, subtract each standalone model's balanced accuracy from that of the integrated model. Calculate differences within each bootstrap sample to compare the same patients directly. The models can differ in feature count and settings, so these contrasts compare complete configurations.
+
+```{r}
+#| label: fig-integration
+#| fig-cap: "Paired differences in balanced accuracy. Positive values favour the integrated model. Lines show 95% bootstrap intervals."
+#| fig-alt: "Two comparisons per model family show integrated minus RNA and integrated minus protein, with zero marked."
+#| fig-width: 8
+#| fig-height: 3.9
+contrasts <- expand.grid(Model = families, Single = assays[1:2], stringsAsFactors = FALSE)
+gains <- do.call(rbind, lapply(seq_len(nrow(contrasts)), function(i) {
+  family <- contrasts$Model[i]
+  single <- paste(family, contrasts$Single[i], sep = " / ")
+  integrated <- paste(family, assays[3], sep = " / ")
+  difference <- bootstrap[integrated, ] - bootstrap[single, ]
+  data.frame(Model = family, Contrast = paste("Combined vs", contrasts$Single[i]),
+             Estimate = metrics[integrated, "Balanced accuracy"] -
+               metrics[single, "Balanced accuracy"],
+             Lower = unname(quantile(difference, 0.025)),
+             Upper = unname(quantile(difference, 0.975)))
+}))
+gains$Model <- factor(gains$Model, levels = families)
+
+ggplot(gains, aes(100 * Estimate, Contrast)) +
+  geom_vline(xintercept = 0, colour = "grey45", linetype = "dashed") +
+  geom_linerange(aes(xmin = 100 * Lower, xmax = 100 * Upper),
+                 colour = "#176084", linewidth = 0.8) +
+  geom_point(colour = "#176084", size = 2.8) +
+  facet_wrap(~ Model) +
+  labs(x = "Difference in balanced accuracy (percentage points)", y = NULL)
+```
+
+## Split conformal prediction
+
+**LAC stands for Least Ambiguous Classifier.** It turns a model's stage scores into a prediction set by applying a cutoff learned from the calibration patients. Each stage is assessed separately, so the set can contain one stage, several stages, or none.
+
+### Build prediction sets with LAC
+
+For each of the 75 calibration patients, take one minus the score the fitted model gave their observed stage. This is the patient's **nonconformity score**. For each test patient, calculate one minus the model score for each candidate stage and rank it against the calibration scores using `predictset::conformal_pvalue()`. At the 90% coverage target, include stages whose conformal p-value is greater than 0.10. The coverage guarantee applies across patients when calibration and test patients are exchangeable. [Emami's classification tutorial](https://payamemami.com/conformal_prediction/practice.html#the-classification-simulation), [predictset documentation](https://cloud.r-project.org/web/packages/predictset/refman/predictset.html#conformal_pvalue)
+
+```{r}
+#| label: conformal-sets
+target <- 0.90
+y_cal <- read_stage("data_split/clin.test.rds", cal_ids)
+cal_scores <- predict_models(cal_ids)
+
+label_index <- function(y) cbind(seq_along(y), as.integer(y))
+
+lac_sets <- function(calibration, test) {
+  # Extract the score for each calibration patient's observed stage.
+  calibration_error <- 1 - calibration[label_index(y_cal)]
+  p_values <- predictset::conformal_pvalue(calibration_error, as.vector(1 - test))
+  # The flattened test scores run down the rows of one stage at a time.
+  included <- matrix(p_values > (1 - target), nrow = nrow(test),
+                     dimnames = dimnames(test))
+  list(covered = included[label_index(y_test)], size = rowSums(included))
+}
+
+sets <- Map(lac_sets, cal_scores, test_scores)
+set_summary <- t(vapply(sets, function(result) {
+  c(Coverage = mean(result$covered), `Mean set size` = mean(result$size),
+    `Empty sets` = sum(result$size == 0), `One-stage sets` = sum(result$size == 1),
+    `Three-stage sets` = sum(result$size == 3))
+}, numeric(5)))
+set_table <- as.data.frame(set_summary)
+set_table$Coverage <- percent(set_table$Coverage)
+knitr::kable(set_table, digits = 2, caption = "LAC prediction sets on the final test patients.")
+```
+
+### Inspect coverage by stage
+
+Coverage is the share of test patients whose set contains the observed stage. Read it alongside the mean set size in the table, since a set with all three stages always covers the outcome. The plot separates overall coverage from stage-specific results. Intervals are wide for stages with few test patients.
+
+```{r}
+#| label: fig-conformal-coverage
+#| fig-cap: "LAC coverage on the final test patients. Lines show exact 95% binomial intervals. The dashed line marks the 90% marginal target."
+#| fig-alt: "Six panels show overall and stage-specific coverage for the two model families and three assay combinations."
+#| fig-width: 9
+#| fig-height: 5.5
+coverage_groups <- c(list(Overall = seq_along(y_test)), stage_rows)
+coverage_plot <- do.call(rbind, lapply(seq_len(nrow(model_grid)), function(i) {
+  result <- sets[[model_grid$ID[i]]]
+  do.call(rbind, lapply(names(coverage_groups), function(group) {
+    covered <- result$covered[coverage_groups[[group]]]
+    interval <- binom.test(sum(covered), length(covered))$conf.int
+    data.frame(Model = model_grid$Model[i], Assay = model_grid$Assay[i],
+               Group = group, Coverage = mean(covered),
+               Lower = interval[1], Upper = interval[2])
+  }))
+}))
+coverage_plot$Model <- factor(coverage_plot$Model, levels = families)
+coverage_plot$Assay <- factor(coverage_plot$Assay, levels = assays)
+coverage_plot$Group <- factor(coverage_plot$Group, levels = rev(names(coverage_groups)))
+
+ggplot(coverage_plot, aes(Coverage, Group)) +
+  geom_vline(xintercept = target, colour = "grey45", linetype = "dashed") +
+  geom_linerange(aes(xmin = Lower, xmax = Upper), colour = "#176084") +
+  geom_point(colour = "#176084", size = 2.5) +
+  facet_grid(Model ~ Assay) +
+  scale_x_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1),
+                     labels = scales::label_percent()) +
+  labs(x = "Observed coverage", y = NULL) +
+  theme(panel.spacing.x = grid::unit(1.2, "lines"))
+```
+
+## Interpretation
+
+```{r}
+#| label: interpretation-values
+#| include: false
+# Pull reported values from the analysis so that the text stays in sync with the tables.
+best <- model_grid$ID[which.max(performance$Estimate)]
+best_score <- metrics[best, "Balanced accuracy"]
+stage_one_recall <- vapply(confusions[model_grid$ID], function(cm) {
+  cm[stages[1], stages[1]] / sum(cm[stages[1], ])
+}, numeric(1))
+gain_text <- if (all(gains$Lower <= 0 & gains$Upper >= 0)) {
+  "All paired intervals comparing the integrated and standalone configurations included zero."
+} else {
+  "At least one paired interval comparing integrated and standalone configurations excluded zero."
+}
+```
+
+**Model comparison.** `r best` had the highest observed test balanced accuracy (`r percent(best_score)`). `r gain_text` Stage I recall ranged from `r percent(min(stage_one_recall))` to `r percent(max(stage_one_recall))` across the six models.
+
+**Prediction sets.** Observed LAC coverage ranged from `r percent(min(set_summary[, "Coverage"]))` to `r percent(max(set_summary[, "Coverage"]))`. Mean set sizes ranged from `r sprintf("%.2f", min(set_summary[, "Mean set size"]))` to `r sprintf("%.2f", max(set_summary[, "Mean set size"]))` stages.
+
+**Scope.** This is an internal follow-up analysis on a holdout cohort that was previously evaluated in full. The bootstrap intervals describe test-cohort variation for these fitted models. RNA ranking by variance can omit informative genes, and the cohort requires availability of all three original assays.
+
+## Reproduce the report
+
+Run from the project root with Quarto and R. The analysis uses `xgboost`, `glmnet`, `predictset`, `pROC`, `matrixStats`, `ggplot2`, `scales`, `knitr`, and `rmarkdown`.
+
+```bash
+quarto render 02_ML_methods/xgboost_elastic_net/04_xgboost_elastic_net.qmd --execute-dir . --output-dir ../../reports
+```
+
+The session information records the R and package versions used to render the report.
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
