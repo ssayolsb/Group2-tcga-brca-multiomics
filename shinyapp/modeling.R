@@ -208,7 +208,7 @@ predict_classifier <- function(x, y, new_x, model, integration, params = NULL) {
                     max_depth = depth, eta = 0.05, tree_method = "hist", nthread = 2),
       data = training, nrounds = rounds, verbose = 0
     )
-    scores <- predict(fit, xgboost::xgb.DMatrix(new_x, nthread = 2), strict_shape = TRUE)
+    scores <- matrix(predict(fit, xgboost::xgb.DMatrix(new_x, nthread = 2), reshape = TRUE), nrow = nrow(new_x))
     colnames(scores) <- stages
     return(list(scores = scores, details = sprintf("%d rounds · depth %d · learning rate 0.05",
                                                    as.integer(rounds), as.integer(depth))))
