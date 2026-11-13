@@ -24,7 +24,9 @@ results_page <- function() {
                radioButtons("results_order", "Best models by", inline = TRUE,
                             choices = c("Training (cross-validation)" = "cv", "Test patients" = "test"),
                             selected = "cv")),
-      plotOutput("results_plot", height = "auto"))),
+      plotOutput("results_plot", height = "auto"),
+      tags$p(class = "stage-note mb-0",
+             "Models are compared by cross-validation; test results are shown for reference only."))),
     bslib::card(bslib::card_body(
       fillable = FALSE,
       tags$div(class = "download-row mb-2",
