@@ -23,7 +23,7 @@ results_page <- function() {
                            ticks = FALSE, width = "320px"),
                radioButtons("results_order", "Best models by", inline = TRUE,
                             choices = c("Training (cross-validation)" = "cv", "Test patients" = "test"),
-                            selected = "test")),
+                            selected = "cv")),
       plotOutput("results_plot", height = "auto"))),
     bslib::card(bslib::card_body(
       fillable = FALSE,
