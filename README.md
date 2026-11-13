@@ -9,6 +9,7 @@ uncertainty of every prediction.
 
 - **App:** <https://01a1d02a-f843-3606-72d2-82eaa15b98ad.share.connect.posit.cloud/>
 - **Code:** <https://github.com/ssayolsb/Group2-tcga-brca-multiomics>
+- **Presentation:** [presentation/Group_2_MultiOmics.pdf](presentation/Group_2_MultiOmics.pdf)
 - **Licence:** MIT (see [LICENSE](LICENSE))
 
 > Course project for teaching and research. The models are not validated for
@@ -50,6 +51,7 @@ Group2-tcga-brca-multiomics/
 │   ├── xgboost_elastic_net/
 │   └── diablo/
 ├── reports/                rendered HTML reports, numbered like the code
+├── presentation/           slides of the final presentation (PDF)
 ├── shinyapp/               Shiny app, results of all models, own renv environment
 └── data/                   NOT in the repository (see below)
 ```
